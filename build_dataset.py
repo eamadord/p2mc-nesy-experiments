@@ -55,19 +55,34 @@ DEFAULT_EXCLUDED_AREAS = {"Methodology", "Miscellaneous"}
 # ---------------------------------------------------------------------------
 # Utilidades
 # ---------------------------------------------------------------------------
-_ARXIV_MODERN = re.compile(r"(\d{4}\.\d{4,5})")
-_ARXIV_OLD = re.compile(r"([a-z\-]+(?:\.[a-z]{2})?/\d{7})")
+_NEW_ID = re.compile(r"^(\d{2}(?:0[1-9]|1[0-2])\.\d{4,5})(?:v\d+)?$")                      # YYMM.NNNN(N)
+_OLD_ID = re.compile(r"^([a-z]+(?:-[a-z]+)*(?:\.[a-z]{2})?/\d{7})(?:v\d+)?$", re.IGNORECASE)  # cs/0101001
+_ARXIV_URL = re.compile(r"arxiv\.org/(?:abs|pdf|html|format)/", re.IGNORECASE)
 
 
 def arxiv_id_from(value):
-    """ID de arXiv sin versión a partir de un ID o de casi cualquier URL de arXiv."""
+    """
+    ID de arXiv sin versión, o None.
+    Solo se acepta (a) un ID tal cual ("1706.03762v5", "cs/0101001") o (b) una URL de
+    arxiv.org. Antes se buscaba el patrón en CUALQUIER URL, y se inventaban IDs a partir
+    de enlaces de IEEE ("document/9555146"), ACM (el DOI 10.1145/3583780.3615067 daba
+    "3780.36150") o ScienceDirect, con lo que esos papers se intentaban bajar de arXiv.
+    """
     if not value or not isinstance(value, str):
         return None
-    v = value.strip().lower()
-    for pat in (_ARXIV_MODERN, _ARXIV_OLD):
-        m = pat.search(v)
-        if m:
-            return m.group(1)
+    v = value.strip()
+    m = _ARXIV_URL.search(v)
+    if m:
+        v = v[m.end():]
+    elif re.match(r"^[a-z]+://", v, re.IGNORECASE):
+        return None  # una URL que no es de arXiv
+    v = re.sub(r"^arxiv:", "", v, flags=re.IGNORECASE)
+    v = re.split(r"[?#]", v)[0].rstrip("/")
+    v = re.sub(r"\.pdf$", "", v, flags=re.IGNORECASE)
+    for pat in (_NEW_ID, _OLD_ID):
+        mm = pat.match(v)
+        if mm:
+            return mm.group(1).lower()
     return None
 
 
@@ -572,6 +587,76 @@ def run_ocr(args):
             print(f"[ocr] {n}/{len(targets)}")
 
 
+def _tei_title(xml_path):
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(Path(xml_path).read_text(encoding="utf-8"), "xml")
+        node = soup.find("titleStmt")
+        node = node.find("title") if node else None
+        return node.get_text(" ", strip=True) if node else ""
+    except Exception:
+        return ""
+
+
+def prune(args):
+    """
+    Deja en el corpus solo papers con PDF y, si ya hay XML (--check-titles), cuyo título
+    en el XML coincida con el del ground truth: así un PDF equivocado (p. ej. de un ID de
+    arXiv inventado que coincide con otro paper) nunca se evalúa contra el GT de otro.
+    Guarda una copia en pwc_final.before_prune.json.
+    """
+    from rapidfuzz import fuzz
+    out_dir = Path(args.out_dir)
+    corpus = _load_corpus(out_dir)
+    pdf_dir, xml_dir = out_dir / "pdfs", out_dir / "xml_outputs"
+    keep, dropped, unverifiable = [], defaultdict(list), 0
+
+    if args.check_titles:
+        with_pdf = [r for r in corpus if (pdf_dir / f"{safe_id(r['arxiv_id'])}.pdf").is_file()]
+        with_xml = sum(1 for r in with_pdf if (xml_dir / f"{safe_id(r['arxiv_id'])}.tei.xml").is_file())
+        if with_pdf and with_xml < 0.9 * len(with_pdf):
+            raise SystemExit(
+                f"Solo hay XML para {with_xml} de {len(with_pdf)} PDFs: --check-titles descartaría casi todo.\n"
+                "Termina primero la fase 'grobid' (python build_dataset.py grobid) y comprueba con 'stats'.")
+
+    def norm(t):
+        return re.sub(r"[^a-z0-9]+", " ", str(t).lower()).strip()
+
+    for r in corpus:
+        sid = safe_id(r["arxiv_id"])
+        if not (pdf_dir / f"{sid}.pdf").is_file():
+            dropped["sin PDF"].append(r)
+            continue
+        if args.check_titles:
+            xml = xml_dir / f"{sid}.tei.xml"
+            if not xml.is_file():
+                dropped["sin XML"].append(r)
+                continue
+            title = _tei_title(xml)
+            if not title:
+                unverifiable += 1          # GROBID no sacó título: no se puede comprobar, se conserva
+            elif fuzz.token_set_ratio(norm(title), norm(r.get("title"))) < args.title_threshold:
+                dropped["el título del PDF no coincide con el del GT"].append(r)
+                continue
+        keep.append(r)
+
+    total_dropped = len(corpus) - len(keep)
+    print(f"[prune] {len(corpus)} papers -> {len(keep)} conservados, {total_dropped} descartados"
+          + (f" ({unverifiable} sin título verificable en el XML)" if args.check_titles else ""))
+    for reason, rows in dropped.items():
+        c = Counter(r["split"] for r in rows)
+        print(f"[prune]   {reason}: {len(rows)} (test={c['test']}, pool={c['pool']})")
+        for r in rows[:5]:
+            print(f"[prune]      {r['arxiv_id']}  {str(r.get('title'))[:70]}")
+    if total_dropped:
+        backup = out_dir / "pwc_final.before_prune.json"
+        if not backup.exists():
+            _atomic_write_json(backup, corpus)
+        _save_corpus(out_dir, keep)
+        print(f"[prune] copia de seguridad en {backup}")
+    stats(args)
+
+
 def stats(args):
     corpus = _load_corpus(args.out_dir)
     by = Counter((r["split"], r["area"]) for r in corpus)
@@ -599,7 +684,7 @@ def stats(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("phase", choices=["select", "pdfs", "grobid", "ocr", "stats", "all"])
+    ap.add_argument("phase", choices=["select", "pdfs", "grobid", "ocr", "prune", "stats", "all"])
     ap.add_argument("--out-dir", default="testing_data_hetero")
     ap.add_argument("--local-dir", default=None, help="usar volcados locales en vez de Hugging Face")
     ap.add_argument("--n-areas", type=int, default=8)
@@ -618,6 +703,9 @@ def main():
     ap.add_argument("--grobid-url", default="http://localhost:8070")
     ap.add_argument("--workers", type=int, default=4, help="peticiones simultáneas a GROBID")
     ap.add_argument("--ocr-pool", action="store_true", help="aplicar OCR también al pool")
+    ap.add_argument("--check-titles", action="store_true",
+                    help="prune: además, descarta papers cuyo título en el XML no coincide con el del GT (tras 'grobid')")
+    ap.add_argument("--title-threshold", type=int, default=70, help="prune: similitud mínima de títulos (0-100)")
     args = ap.parse_args()
 
     if args.phase != "stats":
@@ -631,6 +719,8 @@ def main():
         run_grobid(args)
     if args.phase == "ocr":
         run_ocr(args)
+    if args.phase == "prune":
+        prune(args)
     if args.phase in ("stats", "all") and args.phase != "select":
         stats(args)
 

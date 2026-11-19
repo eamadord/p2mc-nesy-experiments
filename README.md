@@ -1,6 +1,3 @@
-# Instrucciones y documentación respectiva al pipeline de P2MC
-
-En este documento intentaré plasmar un "plano" del pipeline, que partes tiene y cómo funciona. Si algo no queda los suficientemente claro estaré encantado de responder a cualquier duda o aclaración a través de mi slack mateo.campaya@upm.es.
 
 ### Concepto
 

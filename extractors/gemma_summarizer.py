@@ -22,7 +22,7 @@ class GemmaSummarizer:
         prompt=(f"Given the following question: {question}")
         chat.append({"role":"user","content":prompt})
         try:
-            response=self.client.chat(model='gemma4:e4b', messages=chat)
+            response=self.client.chat(model=self.model_name, messages=chat)
             predictions=response['message']['content']
         except Exception as e:
             print(f"Timeout error")

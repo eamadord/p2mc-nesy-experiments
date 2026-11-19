@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+results_mock/
+results/cache/
+data/cbr_storage/
+data/case_base/
+data/raw/
+data/interim/
+.env

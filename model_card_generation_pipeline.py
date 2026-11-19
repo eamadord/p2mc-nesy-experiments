@@ -1,311 +1,301 @@
-from pathlib import Path
-from datetime import datetime
-import joblib
-import json
-import time
+"""
+P2MC-NeSy: generación de model cards con ruta LLM o ruta CBR.
+
+Estructura:
+  * FieldPipeline: extrae los 6 campos evaluables de un paper por cuatro rutas
+      - llm            : modelos grandes por campo (pipeline P2MC original)
+      - cbr            : modelo pequeño + caso(s) recuperado(s)
+      - small          : modelo pequeño SIN caso (ablación: ¿aporta algo el caso?)
+      - retrieval_only : copia los campos del caso más similar, sin LLM (ablación)
+    Todas las rutas usan las mismas entradas por campo y el mismo
+    post-procesado simbólico (TaskMatcher contra LPWC, taxonomía de categorías).
+  * ModelCardGenerator: pipeline de producción. Usa la ruta LLM hasta que la
+    base de casos alcanza el umbral y la ruta CBR a partir de ahí; construye el
+    JSON-LD y conserva (Retain) los casos generados.
+
+Bugs corregidos respecto a la versión anterior:
+  * La ruta LLM no extraía métricas; ahora ambas rutas extraen los mismos campos.
+  * Los datasets de la ruta LLM solo recibían tablas (que además no se cargaban).
+  * Las métricas se guardaban en "metrics" en la ruta CBR y en ningún sitio en la
+    LLM; ahora van en hasEvaluation.evaluationMetrics en ambas.
+  * referencePublication tenía un @id relativo ("1802.04394"); ahora es absoluto.
+  * Se cargaban en GPU modelos que no se usaban (Qwen3-1.7B por transformers,
+    varios GLiNER), lo que contaminaba la medición de recursos.
+  * El mapeo de categorías casi siempre caía en "Other" (ver category_mapper.py).
+"""
 import copy
-import chromadb
-from chromadb.config import Settings
+import json
+import re
+import time
+from datetime import datetime
 
+import joblib
 
-import os
-from extractors.gliner_dataset_extractor import GlinerDatasetExtractor
-from extractors.gliner_metric_extractor import GlinerMetricExtractor
-from extractors.qwen_metric_extractor import QwenMetricExtractor
-from extractors.llama_dataset_extractor import LlamaDatasetExtractor
-from extractors.qwen_dataset_extractor import QwenDatasetExtractor
-from extractors.gliner_extractor import GlinerExtractor
-from extractors.llm_extractors import LlamaExtractor, QwenExtractor, OllamaModelCardAdapter
-from extractors.gemma_summarizer import GemmaSummarizer
-
-from utils.uri_fetcher import UriFetcher
-from utils.uri_builder import UriBuilder
+import config
+from extractors.field_extractor import FieldExtractor, Usage, make_field_specs
+from utils.case_base import CaseBase, Embedder
+from utils.evaluation_tools import normalize_metric
+from utils.paper_loader import build_field_inputs
 from utils.task_matcher import TaskMatcher
-from utils.category_mapper import CategoryMapper
+from utils.uri_builder import UriBuilder
+
+EXTRACTED_FIELDS = ["name", "tasks", "category", "repo", "datasets", "metrics"]
 
 
-MODEL_TEMPLATE_FILE = "template_1.jsonld"
-IMPLEMENTATION_TEMPLATE_FILE = "implementation_template_1.jsonld"
-
-TAXONOMY_CLASSIFIER_FILE = "taxonomy_classifier.joblib"
+def _empty_fields():
+    return {"name": "", "category": "", "tasks": [], "tasks_raw": [], "repo": [], "datasets": [], "metrics": []}
 
 
+class FieldPipeline:
+    def __init__(self, generation="gen2026", client=None, profile=None, category_method=None,
+                 classifier_path=config.TAXONOMY_CLASSIFIER):
+        """
+        profile: perfil de dataset (config.dataset_profile). Determina el vocabulario
+                 del campo cerrado, la pregunta de ese campo y el vocabulario de tareas.
+        """
+        gen = config.GENERATIONS[generation]
+        self.generation = generation
+        self.profile = profile or config.dataset_profile()
+        self.large_models = dict(gen["large"])
+        self.small_model = gen["small"]
+        self.category_method = category_method or self.profile["llm_category_method"]
+        self.labelset = config.category_labelset(self.profile)
+        specs = make_field_specs(self.labelset.labels, self.profile["category_question"])
 
+        o = config.OLLAMA
+        common = dict(client=client, host=o["host"], num_ctx=o["num_ctx"], num_predict=o["num_predict"],
+                      keep_alive=o["keep_alive"], timeout=o["timeout"], specs=specs)
+        self.large = FieldExtractor(self.large_models, **common)
+        self.small = FieldExtractor({f: self.small_model for f in EXTRACTED_FIELDS}, **common)
+
+        self.task_matcher = TaskMatcher(self.profile["tasks_vocab"])
+        self._classifier = None
+        self._classifier_path = classifier_path
+
+    # ------------------------------------------------------------------ utils
+    def _classify_category(self, abstract):
+        if self._classifier is None:
+            self._classifier = joblib.load(self._classifier_path)
+        return str(self._classifier.predict([abstract or ""])[0])
+
+    def _match_tasks(self, raw_tasks):
+        """Post-procesado simbólico: alinea las tareas con el vocabulario LPWC."""
+        out = []
+        for t in raw_tasks:
+            m = self.task_matcher.match_task(t)
+            if m and m["name"] not in out:
+                out.append(m["name"])
+        return out
+
+    def _canonical_category_label(self, label):
+        return self.labelset.canonical(label) or ""
+
+    # ----------------------------------------------------------------- rutas
+    def run(self, route, paper, cases=None):
+        """
+        route: "llm" | "cbr" | "small" | "retrieval_only"
+        paper: dict de utils.paper_loader.load_corpus()
+        cases: lista de casos recuperados (solo cbr / retrieval_only)
+        Devuelve (fields, usage_dict, wall_time_s)
+        """
+        t0 = time.perf_counter()
+        usage = Usage()
+        fields = _empty_fields()
+
+        if route == "retrieval_only":
+            if cases:
+                src = cases[0]["fields"]
+                for f in EXTRACTED_FIELDS:
+                    fields[f] = copy.deepcopy(src.get(f, fields[f]))
+        else:
+            inputs = build_field_inputs(paper)
+            extractor = self.large if route == "llm" else self.small
+            use_cases = cases if route == "cbr" else None
+            case_fields = [c["fields"] for c in (use_cases or [])]
+
+            fields["name"] = extractor.extract("name", inputs["name"], case_fields, usage)
+            fields["tasks_raw"] = extractor.extract("tasks", inputs["tasks"], case_fields, usage)
+            fields["repo"] = extractor.extract("repo", inputs["repo"], case_fields, usage)
+            fields["datasets"] = extractor.extract("datasets", inputs["datasets"], case_fields, usage)
+            fields["metrics"] = extractor.extract("metrics", inputs["metrics"], case_fields, usage)
+
+            if route == "llm" and self.category_method == "classifier":
+                # Solo tiene sentido con la taxonomía KGE (es con la que se entrenó).
+                fields["category"] = self._classify_category(paper.get("abstract"))
+            else:
+                fields["category"] = extractor.extract("category", inputs["category"], case_fields, usage)
+
+            fields["tasks"] = self._match_tasks(fields["tasks_raw"])
+
+        fields["category"] = self._canonical_category_label(fields["category"])
+        fields["repo"] = [u for u in fields["repo"] if re.match(r"^(https?://|www\.|github\.com|gitlab\.com)", u, re.I)]
+        return fields, usage.as_dict(), time.perf_counter() - t0
+
+
+# =============================================================================
+# Pipeline de producción
+# =============================================================================
 class ModelCardGenerator:
-    def __init__(self,cbr_threshold=50):
-        #---COSITAS DE CHROMADB---
-        self.cbr_threshold=cbr_threshold
-        self.chroma_client=chromadb.PersistentClient(path="./data/cbr_storage")
-        self.case_collection=self.chroma_client.get_or_create_collection(name="model_cards_history")
-        print(f"Number of current cases: {self.case_collection.count()}")
-        # First we load both templates, starting with the base model template.
-        model_template_path = Path("templates") / MODEL_TEMPLATE_FILE
-        with open(model_template_path, "r", encoding="utf-8") as f:
-            self._model_template = json.load(f)
+    """
+    Router dinámico: ruta LLM mientras la base de casos tenga menos de
+    `cbr_threshold` casos; ruta CBR a partir de ahí. Los casos generados se
+    conservan (Retain) en `case_dir`.
+    """
 
-        implementation_template_path = Path("templates") / IMPLEMENTATION_TEMPLATE_FILE
-        with open(implementation_template_path, "r", encoding="utf-8") as f:
-            self._implementation_template = json.load(f)
+    def __init__(self, cbr_threshold=500, generation="gen2026", case_dir="data/case_base",
+                 k=1, retain_cbr_cases=False, enrich=True, resolve_uris=True, client=None,
+                 embedder="minilm", dataset="kge"):
+        self.cbr_threshold = cbr_threshold
+        self.k = k
+        self.case_dir = case_dir
+        self.retain_cbr_cases = retain_cbr_cases
+        self.enrich = enrich
+        self.resolve_uris = resolve_uris
 
-        # Load the classifier (TF-IDF + SVC)
-        pipeline_path = Path(os.getcwd()) / "utils" / TAXONOMY_CLASSIFIER_FILE
-        self._classification_pipeline = joblib.load(pipeline_path)
+        self.profile = config.dataset_profile(dataset)
+        self.fields = FieldPipeline(generation=generation, client=client, profile=self.profile)
+        if embedder == "tfidf":
+            raise ValueError("En producción usa 'minilm': el vectorizador TF-IDF no se persiste.")
+        self.case_base = CaseBase(Embedder(embedder)).load(case_dir)
+        print(f"[ModelCardGenerator] casos actuales: {len(self.case_base)}")
 
-        # Load the URI fetcher which will help us identify different entities in SemOpenAlex and LinkedPapersWithCode by providing us with URIs.
-        # On the other hand the URI builder will help creating URIs for those elements we failed to identify or which need our identification.
-        self._uri_fetcher = UriFetcher()
+        with open(config.MODEL_TEMPLATE, encoding="utf-8") as f:
+            self._template = json.load(f)
         self._uri_builder = UriBuilder()
+        self._uri_fetcher = None
+        self._summarizer = None
 
-        # Load llama, qwen and gliner
-        self._gliner = GlinerExtractor()
-        self._qwen = QwenExtractor()
-        self._llama = LlamaExtractor()
-        self._gliner_dataset_extractor = GlinerDatasetExtractor()
-        self._gliner_metric_extractor = GlinerMetricExtractor()
-        self._qwen_metric_extractor = QwenMetricExtractor()
-        self._llama_dataset_extractor = LlamaDatasetExtractor()
-        self._qwen_dataset_extractor = QwenDatasetExtractor()
-        self._modular_cbr_adapter = OllamaModelCardAdapter(model_name="qwen2.5:1.5b")
-        
-        self._summarizer = GemmaSummarizer()
-        self._task_matcher = TaskMatcher()
-        self._category_mapper = CategoryMapper()
+    # ---------------------------------------------------------------- helpers
+    def _fetcher(self):
+        if self._uri_fetcher is None:
+            from utils.uri_fetcher import UriFetcher
+            self._uri_fetcher = UriFetcher()
+        return self._uri_fetcher
 
-        print("Generator ready!")
-        
+    def _metric_uri(self, metric):
+        canon = normalize_metric(metric) or metric
+        slug = re.sub(r"[^a-z0-9]+", "-", canon.lower()).strip("-") or "unknown-metric"
+        return f"{UriBuilder.BASE_URI}/metric/{slug}"
 
-    def _get_timestamp(self):
-        timestamp = datetime.now()
-        timestamp_string = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
-        return timestamp_string
-        
-    def _get_html_tables(self, raw_tables):
-        html_tables = []
-        for page_data in raw_tables.get("results", []):
-            for table_dict in page_data.get("tables", []):
-                if "html" in table_dict:
-                    html_tables.append(table_dict["html"])
-        return html_tables
+    def _dataset_uri(self, dataset):
+        uri = None
+        if self.resolve_uris:
+            try:
+                uri = self._fetcher().guess_dataset_uri(dataset)
+            except Exception:
+                uri = None
+        return uri or self._uri_builder.build_dataset_uri(dataset)
 
-    def _match_tasks(self, tasks):
-        clean_tasks_dict = {}
-        for task in tasks:
-            lpwc_task = self._task_matcher.match_task(task)
-            if(lpwc_task):
-                task_data = {
-                    "@id": lpwc_task["uri"],
-                    "name": lpwc_task["name"],
-                }
-                clean_tasks_dict[lpwc_task["uri"]] = task_data
-        clean_extracted_tasks = list(clean_tasks_dict.values())
-        return clean_extracted_tasks
-    
+    def _author_uri(self, author, arxiv_id):
+        uri = None
+        if self.resolve_uris:
+            try:
+                uri = self._fetcher().extract_author_uri(author, arxiv_id)
+            except Exception:
+                uri = None
+        return uri or self._uri_builder.build_author_uri(author)
 
+    @staticmethod
+    def _clean_empty(d):
+        if isinstance(d, list):
+            items = [ModelCardGenerator._clean_empty(v) for v in d]
+            return [v for v in items if v not in (None, "", [], {})]
+        if isinstance(d, dict):
+            items = {k: ModelCardGenerator._clean_empty(v) for k, v in d.items()}
+            return {k: v for k, v in items.items() if v not in (None, "", [], {})}
+        return d
 
-    
-    def _extract_reference_publication(self, arxiv_id):
-        soa_data = self._uri_fetcher.get_soa_data_from_arxiv_id(arxiv_id)
-        if not soa_data:
-            return None
-        publication_authors = []
-        for author in soa_data.get("authors"):
-            publication_author = {
-                "@type": "Person",
-                "@id": author,
-            }
-            publication_authors.append(publication_author)
-        
-        reference_publication = {
-            "@type": "ScholarlyArticle",
-            "@id": arxiv_id,
-            "author": publication_authors,
-            "schema:sameAs": soa_data.get("soa_uri"),
-            "url": f"https://arxiv.org/abs/{arxiv_id}",
+    # ---------------------------------------------------------------- JSON-LD
+    def build_jsonld(self, paper, fields):
+        arxiv_id = paper["arxiv_id"]
+        jsonld = copy.deepcopy(self._template)
+        jsonld["@id"] = self._uri_builder.build_modelcard_uri(arxiv_id)
+        jsonld["dateCreated"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        jsonld["name"] = fields.get("name") or "Unknown Model"
+
+        tasks = []
+        for t in fields.get("tasks", []):
+            m = self.fields.task_matcher.match_task(t)
+            if m:
+                tasks.append({"@id": m["uri"], "name": m["name"]})
+        jsonld["mlTask"] = tasks
+        jsonld.pop("modelCategory", None)
+        cat = self.fields.labelset.object(fields.get("category"))
+        if cat:
+            jsonld[self.profile["jsonld_category_property"]] = cat
+        jsonld["codeRepository"] = list(dict.fromkeys(fields.get("repo", [])))
+        jsonld["evaluatedOn"] = [{"@id": self._dataset_uri(d), "name": d} for d in fields.get("datasets", [])]
+
+        metrics = []
+        for m in fields.get("metrics", []):
+            uri = self._metric_uri(m)
+            if uri not in {x["@id"] for x in metrics}:  # MR y Mean Rank -> una sola URI
+                metrics.append({"@id": uri, "name": m})
+        jsonld["hasEvaluation"] = {
+            "@type": "fair4ml:MLModelEvaluation",
+            "evaluationMetrics": metrics,
         }
 
-        return reference_publication
-        
-    def _extract_classification(self, text):
-        predicted_class = self._classification_pipeline.predict([text]).tolist()
-        return predicted_class[0]
+        authors = paper.get("authors") or []
+        jsonld["author"] = [{"@id": self._author_uri(a, arxiv_id), "name": a} for a in authors]
 
-    def _order_publication_authors(self, reference_authors, publication_authors):
-        right_order = {author['@id']: i for i, author in enumerate(reference_authors)}
-        publication_authors.sort(key=lambda x: right_order.get(x['@id'], float('inf')))
-        return publication_authors
-        
-    def _clean_empty_fields(self, d):
-        if not isinstance(d, (dict, list)):
-            return d
-            
-        if isinstance(d, list):
-            # Limpia los elementos de la lista y quita los que se queden vacíos
-            cleaned_list = [self._clean_empty_fields(v) for v in d]
-            return [v for v in cleaned_list if v not in (None, "", [], {})]
-            
-        if isinstance(d, dict):
-            # Limpia los valores del diccionario
-            cleaned_dict = {k: self._clean_empty_fields(v) for k, v in d.items()}
-            # Devuelve el diccionario sin las claves cuyos valores acabaron vacíos
-            return {k: v for k, v in cleaned_dict.items() if v not in (None, "", [], {})}
-        
-    def _generate_modelcard_llms(self, extracted_data):
-        jsonld = copy.deepcopy(self._model_template)
-        
-        jsonld["dateCreated"] = self._get_timestamp()
-
-        abstract = extracted_data.get("abstract")
-        full_text = extracted_data.get("full_text")
-        html_tables = self._get_html_tables(extracted_data.get("tables"))
-        arxiv_id = extracted_data.get("arxiv_id")
-
-        jsonld["@id"] = self._uri_builder.build_modelcard_uri(arxiv_id)
-        
-        extracted_names = self._llama.extract(full_text, question = "What is the name of the model presented in this paper?")
-        if extracted_names:
-            jsonld["name"] = extracted_names[0]
+        if self.enrich:
+            jsonld.update(self._enrichment(paper, jsonld["author"]))
         else:
-            jsonld["name"] = "Unknown Model"
+            jsonld.pop("referencePublication", None)
+            jsonld.pop("description", None)
+            jsonld.pop("keywords", None)
+        return self._clean_empty(jsonld)
 
-            
-        jsonld["description"] = self._summarizer.summarize(abstract)
-        jsonld["keywords"] = self._summarizer.get_keywords(abstract)
+    def _enrichment(self, paper, authors):
+        """Descripción, keywords y publicación de referencia (no se evalúan ni se cronometran)."""
+        out = {}
+        if self._summarizer is None:
+            from extractors.gemma_summarizer import GemmaSummarizer
+            self._summarizer = GemmaSummarizer()
+        abstract = paper.get("abstract", "")
+        out["description"] = self._summarizer.summarize(abstract) or ""
+        out["keywords"] = self._summarizer.get_keywords(abstract) or []
 
-        
-        # Dataset extraction and identification
-        extracted_datasets = self._qwen_dataset_extractor.extract("", html_tables)
-        for dataset in extracted_datasets:
-            
-            dataset_uri = self._uri_fetcher.guess_dataset_uri(dataset)
-            if not dataset_uri:
-                dataset_uri = self._uri_builder.build_dataset_uri(dataset)
+        arxiv_id = paper["arxiv_id"]
+        ref = {
+            "@type": "ScholarlyArticle",
+            "@id": f"https://arxiv.org/abs/{arxiv_id}",   # URI absoluta (antes era relativa)
+            "url": f"https://arxiv.org/abs/{arxiv_id}",
+            "author": [{"@type": "Person", "@id": a["@id"]} for a in authors],
+        }
+        if self.resolve_uris:
+            try:
+                soa = self._fetcher().get_soa_data_from_arxiv_id(arxiv_id)
+            except Exception:
+                soa = None
+            if soa:
+                ref["schema:sameAs"] = soa.get("soa_uri")
+                if soa.get("publicationDate"):
+                    ref["datePublished"] = soa.get("publicationDate")
+        out["referencePublication"] = ref
+        return out
 
-            dataset_data = {
-                "@id": dataset_uri,
-                "name": dataset,
-            }
-            jsonld["evaluatedOn"].append(dataset_data)
+    # ------------------------------------------------------------------ router
+    def generate_modelcard(self, paper):
+        """
+        paper: dict con arxiv_id, title, abstract, full_text, sections, tables_tsv, authors
+        Devuelve (jsonld, info) donde info incluye la ruta usada, tiempos y uso de tokens.
+        """
+        if len(self.case_base) < self.cbr_threshold:
+            route, cases = "llm", None
+        else:
+            route = "cbr"
+            cases = [c for _, c in self.case_base.retrieve(paper.get("abstract"), k=self.k,
+                                                           exclude_id=paper["arxiv_id"])]
+        fields, usage, wall = self.fields.run(route, paper, cases)
 
-        extracted_category = self._extract_classification(abstract)
-        category_object = self._category_mapper.get_category_object(extracted_category)
-        jsonld["modelCategory"] = category_object
-        
-        # Author identification
-        for author in extracted_data.get("authors"):
-            author_uri = self._uri_fetcher.extract_author_uri(author, arxiv_id)
-            if not author_uri:
-                author_uri = self._uri_builder.build_author_uri(author)
-            author_data = {
-                "@id": author_uri,
-                "name": author,
-            }
-            jsonld["author"].append(author_data)
+        if route == "llm" or self.retain_cbr_cases:
+            self.case_base.add({"arxiv_id": paper["arxiv_id"], "abstract": paper.get("abstract", ""),
+                                "fields": fields, "source": route})
+            self.case_base.save(self.case_dir)
 
-        # Task extraction and identification
-        tasks_prediction = self._llama.extract(abstract, question =  "What are the tasks addressed in this paper?")
-        jsonld["mlTask"] = self._match_tasks(tasks_prediction)
-        
-        extracted_repo = self._llama.extract(full_text, question = "Return the URL link for the paper implementation (like GitHub). Return an empty list if not found. DO NOT  invent links")
-        jsonld["codeRepository"] = list(set(extracted_repo))
-
-        reference_publication = self._extract_reference_publication(arxiv_id)
-        if(reference_publication):
-            jsonld["referencePublication"] = reference_publication
-
-        jsonld["referencePublication"]["author"] = self._order_publication_authors(jsonld["author"], jsonld["referencePublication"]["author"])
-
-        clean_jsonld = self._clean_empty_fields(jsonld)
-        return clean_jsonld
-        
-    def _generate_modelcard_cbr(self, extracted_data):
-        abstract = extracted_data.get("abstract", "")
-        arxiv_id = extracted_data.get("arxiv_id", "")
-        title = extracted_data.get("title", "")
-        sections = extracted_data.get("sections", "")
-        full_text = extracted_data.get("full_text", "")
-        
-        # 1. RETRIEVE
-        results = self.case_collection.query(
-            query_texts=[abstract],
-            n_results=1
-        )
-        
-        if not results.get('metadatas') or not results['metadatas'][0]:
-            return self._generate_modelcard_llms(extracted_data)
-            
-        sim_case = json.loads(results['metadatas'][0][0]['model_card_json'])
-        
-        # Extraemos pistas del caso similar para guiar al modelo
-        sim_name = sim_case.get("name", "")
-        sim_tasks = [t.get("name") if isinstance(t, dict) else t for t in sim_case.get("mlTask", [])]
-        sim_cat = sim_case.get("modelCategory", {}).get("name", "") if isinstance(sim_case.get("modelCategory"), dict) else ""
-        sim_repo = sim_case.get("codeRepository", [])
-        sim_datasets = [d.get("name") if isinstance(d, dict) else d for d in sim_case.get("evaluatedOn", [])]
-        sim_metrics = [m.get("name") if isinstance(m, dict) else m for m in sim_case.get("metrics", [])]
-    
-        # 2. REVISE / EXTRACT MODULAR
-        pred_model = self._modular_cbr_adapter.extract_model_name(title, abstract, sim_name)
-        pred_tasks = self._modular_cbr_adapter.extract_tasks(abstract, sim_tasks)
-        pred_cat = self._modular_cbr_adapter.extract_category(abstract, sim_cat)
-        pred_repo = self._modular_cbr_adapter.extract_repo(abstract, full_text, sim_repo)
-        pred_datasets, pred_metrics = self._modular_cbr_adapter.extract_datasets_and_metrics(sections, sim_datasets, sim_metrics)
-    
-        # 3. ENSAMBLAJE DE LA MODEL CARD (JSON-LD)
-        jsonld = copy.deepcopy(self._model_template)
-        jsonld["dateCreated"] = self._get_timestamp()
-        jsonld["@id"] = self._uri_builder.build_modelcard_uri(arxiv_id)
-        jsonld["name"] = pred_model
-        
-        # Tasks
-        jsonld["mlTask"] = self._match_tasks(pred_tasks) if hasattr(self, '_match_tasks') else [{"name": t} for t in pred_tasks]
-        
-        # Category
-        jsonld["modelCategory"] = self._category_mapper.get_category_object(pred_cat) if hasattr(self, '_category_mapper') else {"name": pred_cat}
-        
-        # Code Repository
-        jsonld["codeRepository"] = pred_repo
-
-        # Datasets
-        jsonld["evaluatedOn"] = []
-        for d in pred_datasets:
-            uri = self._uri_fetcher.guess_dataset_uri(d) or self._uri_builder.build_dataset_uri(d) if hasattr(self, '_uri_fetcher') else ""
-            jsonld["evaluatedOn"].append({"@id": uri, "name": d})
-            
-        # Metrics
-        jsonld["metrics"] = [{"name": m} for m in pred_metrics]
-        
-        # Autores
-        for author in extracted_data.get("authors", []):
-            author_uri = self._uri_fetcher.extract_author_uri(author, arxiv_id) or self._uri_builder.build_author_uri(author) if hasattr(self, '_uri_fetcher') else ""
-            jsonld["author"].append({"@id": author_uri, "name": author})
-    
-        return self._clean_empty_fields(jsonld)
-        
-
-    def generate_modelcard(self, extracted_data):
-            """Router Dinámico: Decide si usar LLMs o CBR basado en el histórico"""
-            current_cases = self.case_collection.count()
-            
-            if current_cases < self.cbr_threshold:
-                print("Ruta: LLM (Construyendo base de conocimiento...)")
-                # 1. Generamos con tu código original
-                final_jsonld = self._generate_modelcard_llms(extracted_data)
-                
-                # 2. Retain: Guardamos el caso para el futuro
-                abstract = extracted_data.get("abstract", "")
-                arxiv_id = extracted_data.get("arxiv_id", str(current_cases))
-                
-                # Guardamos el abstract como texto de búsqueda, y el JSON como metadata
-                self.case_collection.add(
-                    documents=[abstract],
-                    metadatas=[{"model_card_json": json.dumps(final_jsonld)}],
-                    ids=[f"paper_{arxiv_id}"]
-                )
-                return final_jsonld
-            else:
-                print("Ruta: CBR + qwen1B (Masa crítica alcanzada!)")
-                return self._generate_modelcard_cbr(extracted_data)
-
-  
-
-
+        jsonld = self.build_jsonld(paper, fields)
+        info = {"route": route, "extraction_wall_s": wall, **usage,
+                "retrieved": [c["arxiv_id"] for c in (cases or [])]}
+        return jsonld, info

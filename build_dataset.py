@@ -29,14 +29,18 @@ Fases (todas reanudables):
 Requiere: pip install datasets requests (y GROBID en marcha para la fase grobid).
 """
 import argparse
+import fcntl
 import gzip
 import json
+import os
 import random
 import re
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from tqdm import tqdm
 
 HF_SOURCES = {
     "papers": "pwc-archive/papers-with-abstracts",
@@ -151,8 +155,11 @@ def load_source(key, local_dir=None):
                 return json.load(f)
         raise FileNotFoundError(f"No encuentro {stem}.(json|json.gz|jsonl|parquet) en {base}")
     from datasets import load_dataset
-    print(f"[select] cargando {HF_SOURCES[key]} ...")
-    return load_dataset(HF_SOURCES[key], split="train")
+    t0 = time.time()
+    print(f"[select] descargando/cargando {HF_SOURCES[key]} (la 1ª vez baja de Hugging Face; luego va por caché) ...", flush=True)
+    ds = load_dataset(HF_SOURCES[key], split="train")
+    print(f"[select]   {HF_SOURCES[key]}: {len(ds)} filas en {time.time() - t0:.0f}s", flush=True)
+    return ds
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +189,9 @@ def walk_datasets(ds_row):
 
 def build_ground_truth(papers_src, links_src, evals_src, repo_policy="official_or_mentioned"):
     # Índice de papers por ID de arXiv y por URL normalizada
+    t0 = time.time()
     papers, by_url = {}, {}
-    for p in papers_src:
+    for p in tqdm(papers_src, desc="[select] papers", unit="paper", mininterval=10, leave=True):
         p = dict(p)
         aid = arxiv_id_from(p.get("arxiv_id")) or arxiv_id_from(p.get("url_abs"))
         if not aid:
@@ -193,14 +201,15 @@ def build_ground_truth(papers_src, links_src, evals_src, repo_policy="official_o
         for u in (p.get("url_abs"), p.get("url_pdf"), p.get("paper_url")):
             if u:
                 by_url[norm_url(u)] = aid
-    print(f"[select] {len(papers)} papers con ID de arXiv")
+    print(f"[select] {len(papers)} papers con ID de arXiv ({time.time() - t0:.0f}s)", flush=True)
 
     def resolve(url):
         return arxiv_id_from(url) or by_url.get(norm_url(url))
 
     # Repositorios
+    t0 = time.time()
     repos, all_repos = defaultdict(list), defaultdict(list)
-    for l in links_src:
+    for l in tqdm(links_src, desc="[select] enlaces a código", unit="enlace", mininterval=10):
         aid = arxiv_id_from(l.get("paper_arxiv_id")) or resolve(l.get("paper_url_abs")) or resolve(l.get("paper_url"))
         repo = l.get("repo_url")
         if not aid or not repo:
@@ -212,12 +221,15 @@ def build_ground_truth(papers_src, links_src, evals_src, repo_policy="official_o
         if keep and repo not in repos[aid]:
             repos[aid].append(repo)
 
+    print(f"[select] enlaces procesados ({time.time() - t0:.0f}s)", flush=True)
+
     # Tablas de evaluación
+    t0 = time.time()
     gt = defaultdict(lambda: {"datasets": set(), "metrics": set(), "names": Counter(),
                               "eval_tasks": set(), "areas": Counter()})
     task_vocab = {}
     unresolved = 0
-    for row in evals_src:
+    for row in tqdm(evals_src, desc="[select] tablas de evaluación (tareas)", unit="tarea", mininterval=10):
         for t_name, t_areas, t_syn, t_datasets in walk_tasks(dict(row)):
             if t_name:
                 entry = task_vocab.setdefault(t_name, {"areas": set(), "synonyms": set()})
@@ -249,7 +261,8 @@ def build_ground_truth(papers_src, links_src, evals_src, repo_policy="official_o
                             g["eval_tasks"].add(t_name)
                         for a in t_areas:
                             g["areas"][a] += 1
-    print(f"[select] {len(gt)} papers con resultados en leaderboards ({unresolved} filas sin paper identificable)")
+    print(f"[select] {len(gt)} papers con resultados en leaderboards "
+          f"({unresolved} filas sin paper identificable) ({time.time() - t0:.0f}s)", flush=True)
     return papers, repos, all_repos, gt, task_vocab
 
 
@@ -373,8 +386,7 @@ def select(args):
         pool.extend(cands[: args.n_pool_per_area])
 
     corpus = test + pool
-    with open(out_dir / "pwc_final.json", "w", encoding="utf-8") as f:
-        json.dump(corpus, f, ensure_ascii=False, indent=1)
+    _atomic_write_json(out_dir / "pwc_final.json", corpus)
     with open(out_dir / "areas.json", "w", encoding="utf-8") as f:
         json.dump(target, f, ensure_ascii=False, indent=1)
 
@@ -403,12 +415,58 @@ def _load_corpus(out_dir):
         return json.load(f)
 
 
+def _atomic_write_json(path, obj, indent=1):
+    """
+    Escribe JSON de forma atómica. El fichero temporal lleva el PID del proceso:
+    con un nombre fijo, dos procesos se pisaban el .tmp y el segundo `replace`
+    fallaba con FileNotFoundError.
+    """
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():  # solo si algo falló antes del replace
+            tmp.unlink()
+
+
 def _save_corpus(out_dir, corpus):
-    path = Path(out_dir) / "pwc_final.json"
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(corpus, f, ensure_ascii=False, indent=1)
-    tmp.replace(path)
+    _atomic_write_json(Path(out_dir) / "pwc_final.json", corpus)
+
+
+_LOCK_HANDLE = None
+
+
+def acquire_lock(out_dir):
+    """
+    Impide dos build_dataset.py a la vez sobre la misma carpeta: se sobrescribirían
+    el progreso (cada uno guarda su copia del corpus en memoria).
+    """
+    global _LOCK_HANDLE
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fh = open(out_dir / ".build_dataset.lock", "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.seek(0)
+        pid = fh.read().strip() or "desconocido"
+        raise SystemExit(
+            f"Ya hay otro build_dataset.py trabajando sobre {out_dir}/ (PID {pid}).\n"
+            f"Espera a que termine o páralo con: kill {pid}\n"
+            "Para ver los que hay en marcha: pgrep -fa build_dataset")
+    except OSError as e:  # p. ej. sistemas de ficheros sin soporte de flock
+        print(f"[lock] AVISO: no se pudo bloquear {out_dir}/ ({e}). Asegúrate de no lanzar dos instancias a la vez.")
+        return
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _LOCK_HANDLE = fh
 
 
 def download_pdfs(args):
@@ -561,6 +619,9 @@ def main():
     ap.add_argument("--workers", type=int, default=4, help="peticiones simultáneas a GROBID")
     ap.add_argument("--ocr-pool", action="store_true", help="aplicar OCR también al pool")
     args = ap.parse_args()
+
+    if args.phase != "stats":
+        acquire_lock(args.out_dir)
 
     if args.phase in ("select", "all"):
         select(args)

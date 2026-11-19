@@ -268,6 +268,11 @@ def main():
 
     profile = config.dataset_profile(args.dataset)
     out = Path(args.results) / profile["name"]
+    if not (out / "split.json").is_file():
+        raise SystemExit(
+            f"No hay resultados en {out}/ (falta split.json).\n"
+            f"Ejecuta primero: python experiment_cbr.py all --dataset {profile['name']} "
+            "[--generation gen2026]")
     df, n_test = load_scores(out, profile, use_bertscore=args.bertscore)
     if df.empty:
         raise SystemExit("No hay predicciones que evaluar.")

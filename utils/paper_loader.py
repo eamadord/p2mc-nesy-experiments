@@ -42,11 +42,21 @@ _URL_HINT = re.compile(
 # Tablas (LightOnOCR -> TSV compacto)
 # ---------------------------------------------------------------------------
 def html_tables_from_ocr(raw):
+    """
+    Fragmentos HTML de tablas de un JSON de LightOnOCR. Acepta los dos formatos:
+      - {"file_name": ..., "results": [{"page":.., "tables":[..]}]}    (JSON existentes de testing_data/)
+      - {"documents": [{"file_name": ..., "results": [...]}]}          (salida de LightOcrParser.process)
+    """
+    if isinstance(raw, dict) and "documents" in raw:
+        docs = raw.get("documents") or []
+    else:
+        docs = [raw]
     tables = []
-    for page in (raw or {}).get("results", []) or []:
-        for t in page.get("tables", []) or []:
-            if isinstance(t, dict) and t.get("html"):
-                tables.append(t["html"])
+    for doc in docs:
+        for page in (doc or {}).get("results", []) or []:
+            for t in page.get("tables", []) or []:
+                if isinstance(t, dict) and t.get("html"):
+                    tables.append(t["html"])
     return tables
 
 
@@ -168,7 +178,16 @@ def _find_ocr_dir(data_dir):
 
 def load_corpus(data_dir="testing_data", category_field="model_category", verbose=True):
     data_dir = Path(data_dir)
-    with open(data_dir / "pwc_final.json", encoding="utf-8") as f:
+    pwc_path = data_dir / "pwc_final.json"
+    if not pwc_path.is_file():
+        raise SystemExit(
+            f"No existe {pwc_path}: este perfil de dataset todavía no tiene corpus.\n"
+            "Para el perfil 'hetero' hay que construirlo antes, en este orden:\n"
+            "  python build_dataset.py select\n"
+            "  python build_dataset.py pdfs\n"
+            "  python build_dataset.py grobid\n"
+            "(el perfil 'kge' usa testing_data/, que ya viene en el repo). Ver README_EXPERIMENTS.md.")
+    with open(pwc_path, encoding="utf-8") as f:
         raw = json.load(f)
 
     ocr_dir = _find_ocr_dir(data_dir)
@@ -225,8 +244,20 @@ def load_corpus(data_dir="testing_data", category_field="model_category", verbos
             "split": paper.get("split"),
         })
 
+    if not corpus:
+        n_xml = sum(1 for p in raw if p.get("local_xml_path"))
+        raise SystemExit(
+            f"{pwc_path} tiene {len(raw)} papers, pero ninguno se ha podido cargar "
+            f"({n_xml} con 'local_xml_path'; los XML se buscan en {data_dir / 'xml_outputs'}/).\n"
+            "Faltan los PDFs y/o su conversión a XML. Ejecuta, en este orden:\n"
+            "  python build_dataset.py pdfs\n"
+            "  python build_dataset.py grobid\n"
+            "y comprueba el resultado con: python build_dataset.py stats")
     if verbose:
         print(f"[corpus] {len(corpus)} papers cargados, {skipped} descartados, {with_tables} con tablas OCR.")
+        if skipped > 0.1 * len(raw):
+            print(f"[corpus] AVISO: se han descartado {skipped} de {len(raw)} papers (sin XML o con XML ilegible). "
+                  "Revisa las fases 'pdfs' y 'grobid' con: python build_dataset.py stats")
     return corpus
 
 

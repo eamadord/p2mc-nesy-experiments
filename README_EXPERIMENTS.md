@@ -21,6 +21,8 @@ python build_dataset.py ocr         # opcional: tablas con LightOnOCR, solo test
 python build_dataset.py stats
 ```
 
+**Orden obligatorio:** `experiment_cbr.py --dataset hetero` no arranca hasta que existan `testing_data_hetero/pwc_final.json` (fase `select`) y los XML de los papers (fases `pdfs` y `grobid`). Si falta algo, el programa lo dice y te indica qué ejecutar.
+
 Por defecto: las 8 áreas con más papers completos (sin "Methodology" ni "Miscellaneous"), 75 papers de test y 300 de pool por área. Se puede cambiar con `--areas`, `--n-test-per-area`, `--n-pool-per-area`, `--min-year` y `--repo-policy official`.
 
 Un paper es **completo** si tiene ID de arXiv, abstract, nombre del modelo, al menos una tarea, un dataset, una métrica y un repositorio oficial o citado en el paper, y un área. El pool no exige completitud: solo alimenta la base de casos, que se construye con predicciones del LLM.

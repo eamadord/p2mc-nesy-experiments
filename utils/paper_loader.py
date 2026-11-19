@@ -41,37 +41,62 @@ _URL_HINT = re.compile(
 # ---------------------------------------------------------------------------
 # Tablas (LightOnOCR -> TSV compacto)
 # ---------------------------------------------------------------------------
+def _iter_ocr_tables(raw):
+    """
+    Tablas de un JSON de LightOnOCR, en cualquiera de sus tres formatos:
+      A) {"file_name", "results": [{"page", "tables": [{"html": ...}]}]}            (JSON de testing_data/)
+      B) {"documents": [{"paper_title", "tables": [{"page", "evaluation": {"columns"}, "rows"}]}]}
+                                                                          (salida de LightOcrParser.process)
+      C) {"file_name", "results": [{"page", "tables": [{"html", "columns", "rows"}]}]}  (fase ocr de build_dataset.py)
+    Antes solo se leía A: el formato B daba 0 tablas sin avisar.
+    """
+    docs = raw.get("documents") if isinstance(raw, dict) and "documents" in raw else [raw]
+    for doc in docs or []:
+        if not isinstance(doc, dict):
+            continue
+        for page in doc.get("results") or []:
+            for t in (page or {}).get("tables") or []:
+                if isinstance(t, dict):
+                    yield t
+        for t in doc.get("tables") or []:
+            if isinstance(t, dict):
+                yield t
+
+
 def html_tables_from_ocr(raw):
-    """
-    Fragmentos HTML de tablas de un JSON de LightOnOCR. Acepta los dos formatos:
-      - {"file_name": ..., "results": [{"page":.., "tables":[..]}]}    (JSON existentes de testing_data/)
-      - {"documents": [{"file_name": ..., "results": [...]}]}          (salida de LightOcrParser.process)
-    """
-    if isinstance(raw, dict) and "documents" in raw:
-        docs = raw.get("documents") or []
-    else:
-        docs = [raw]
-    tables = []
-    for doc in docs:
-        for page in (doc or {}).get("results", []) or []:
-            for t in page.get("tables", []) or []:
-                if isinstance(t, dict) and t.get("html"):
-                    tables.append(t["html"])
-    return tables
+    """Fragmentos HTML de las tablas que los traen (compatibilidad con el formato A)."""
+    return [t["html"] for t in _iter_ocr_tables(raw) if t.get("html")]
+
+
+def _table_text(t):
+    """Una tabla como texto tabulado (cabecera + filas)."""
+    columns = t.get("columns") or (t.get("evaluation") or {}).get("columns")
+    rows = t.get("rows")
+    if columns and rows:
+        lines = ["\t".join(str(c) for c in columns)]
+        lines += ["\t".join("" if c is None else str(c) for c in row) for row in rows]
+        return "\n".join(lines) + "\n"
+    if t.get("html") and str(t["html"]).strip():
+        try:
+            return "\n".join(df.to_csv(index=False, sep="\t") for df in pd.read_html(StringIO(t["html"])))
+        except Exception:
+            return ""
+    return ""
+
+
+def ocr_to_tsv(raw, budget=CHAR_BUDGET["tables"]):
+    """Todas las tablas de un JSON de OCR como texto tabulado, truncado a `budget` caracteres."""
+    out = []
+    for t in _iter_ocr_tables(raw):
+        text = _table_text(t)
+        if text.strip():
+            out.append(f"[Table {len(out) + 1}]\n{text}")
+    return "\n".join(out)[:budget]
 
 
 def tables_to_tsv(html_tables, budget=CHAR_BUDGET["tables"]):
-    out, n = [], 1
-    for frag in html_tables:
-        if not frag or not frag.strip():
-            continue
-        try:
-            for df in pd.read_html(StringIO(frag)):
-                out.append(f"[Table {n}]\n{df.to_csv(index=False, sep=chr(9))}")
-                n += 1
-        except Exception:
-            continue
-    return "\n".join(out)[:budget]
+    """Compatibilidad: lista de fragmentos HTML -> texto tabulado."""
+    return ocr_to_tsv({"results": [{"tables": [{"html": h} for h in html_tables or []]}]}, budget)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +250,7 @@ def load_corpus(data_dir="testing_data", category_field="model_category", verbos
             if ocr_path.is_file():
                 try:
                     with open(ocr_path, encoding="utf-8") as f:
-                        tables_tsv = tables_to_tsv(html_tables_from_ocr(json.load(f)))
+                        tables_tsv = ocr_to_tsv(json.load(f))
                 except Exception:
                     tables_tsv = ""
         with_tables += bool(tables_tsv)

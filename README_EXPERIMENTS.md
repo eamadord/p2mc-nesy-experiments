@@ -17,11 +17,24 @@ Hay dos perfiles de dataset (`config.DATASETS`), que se eligen con `--dataset`:
 python build_dataset.py select      # GT desde pwc-archive + partición
 python build_dataset.py pdfs        # PDFs de arXiv (3 s entre peticiones: ~1 h por cada 1.000 papers)
 python build_dataset.py grobid      # TEI XML (GROBID en localhost:8070)
-python build_dataset.py ocr         # opcional: tablas con LightOnOCR, solo test
+python build_dataset.py ocr         # tablas con LightOnOCR (GPU): ver "Tablas con LightOnOCR" más abajo
 python build_dataset.py stats
 ```
 
 **Orden obligatorio:** `experiment_cbr.py --dataset hetero` no arranca hasta que existan `testing_data_hetero/pwc_final.json` (fase `select`) y los XML de los papers (fases `pdfs` y `grobid`). Si falta algo, el programa lo dice y te indica qué ejecutar.
+
+### Tablas con LightOnOCR
+
+Los datasets y las métricas viven en las tablas de resultados, así que las entradas de `datasets` y `metrics` incluyen las tablas extraídas con LightOnOCR (`lightocr_jsons/`). Todos los papers deben tener el mismo tratamiento: si solo unos tuvieran tablas, las entradas no serían comparables entre ellos.
+
+LightOnOCR procesa cada página como una imagen con un modelo de 1.000 millones de parámetros, así que es la fase más cara. Para que sea viable, por defecto solo se envían las páginas que **parecen tener una tabla**: las que en la capa de texto del PDF tienen un pie de tabla ("Table 3:") al inicio de línea y al menos 10 números, hasta 8 por paper (`--ocr-pages all` las procesa todas). Es una heurística comprobada con PDFs sintéticos, no con PDFs reales de arXiv: conviene revisar a mano unos cuantos papers.
+
+```bash
+python build_dataset.py ocr --ocr-limit 5      # primero 5 papers: imprime s/paper y la estimación en horas
+python build_dataset.py ocr                    # luego todos; reanudable
+```
+
+La fase es reanudable (se salta los JSON válidos y rehace los corruptos), sigue si un paper falla y no necesita GROBID, así que puede ejecutarse a la vez que él. El cargador del experimento lee tanto el formato de los JSON de `testing_data/` como el de `LightOcrParser` y el de esta fase.
 
 Por defecto: las 8 áreas con más papers completos (sin "Methodology" ni "Miscellaneous"), 75 papers de test y 300 de pool por área. Se puede cambiar con `--areas`, `--n-test-per-area`, `--n-pool-per-area`, `--min-year` y `--repo-policy official`.
 
@@ -57,7 +70,7 @@ conda activate p2mc-nesy
 ```
 
 - `scikit-learn` está fijado a **1.5.0 exacto** porque `utils/taxonomy_classifier.joblib` se serializó con esa versión; con cualquier otra scikit-learn avisa al cargarlo.
-- Se instala `pytorch-cpu`: basta para los embeddings de la base de casos (all-MiniLM-L6-v2). Solo la fase `build_dataset.py ocr` (LightOnOCR) necesita GPU; para ella ejecuta `conda install -n p2mc-nesy pytorch-gpu` o crea un entorno aparte.
+- Se instala `pytorch-cpu`: basta para los embeddings de la base de casos (all-MiniLM-L6-v2). Solo la fase `build_dataset.py ocr` (LightOnOCR) necesita GPU: úsala en un entorno aparte, `conda create -n p2mc-ocr --clone p2mc-nesy` y `conda install -n p2mc-ocr -c conda-forge pytorch-gpu`, para no tocar el entorno de los experimentos.
 - Actualizar el entorno tras cambiar `environment.yml`: `conda env update -f environment.yml --prune`.
 - Para congelar las versiones exactas con las que salieron los resultados del paper, súbelas al repo:
   ```bash

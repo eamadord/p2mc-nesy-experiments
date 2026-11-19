@@ -567,24 +567,129 @@ def run_grobid(args):
     print(f"[grobid] con XML: {sum(1 for r in corpus if r.get('local_xml_path'))}/{len(corpus)}")
 
 
-def run_ocr(args):
-    """Tablas con LightOnOCR (lento: GPU). Por defecto solo para el test."""
-    from parsers.lightocr_parser import LightOcrParser
+_TABLE_CAPTION = re.compile(r"^\s*TABLE\s+(?:\d+|[IVXL]+)\s*[.:]", re.IGNORECASE | re.MULTILINE)
+
+
+def select_table_pages(pdf_doc, mode="auto", max_pages=8):
+    """
+    Páginas (índices desde 0) que se envían al OCR.
+      all  : todas (limitadas a max_pages si se indica).
+      auto : páginas cuya capa de texto tiene un pie de tabla ("Table 3:" al inicio de línea)
+             y bastantes números. Es una heurística: nombra la tabla al principio de línea, así
+             que las menciones en el cuerpo ("see Table 2") no cuentan. Si el PDF no tiene capa
+             de texto (escaneado) o no hay ninguna candidata, se cae a las primeras max_pages.
+    """
+    n = len(pdf_doc)
+    if mode == "all":
+        return list(range(n if not max_pages else min(n, max_pages)))
+    scored = []
+    for i in range(n):
+        try:
+            text = pdf_doc[i].get_textpage().get_text_range() or ""
+        except Exception:
+            text = ""
+        digits = len(re.findall(r"\d+(?:\.\d+)?", text))
+        if _TABLE_CAPTION.search(text) and digits >= 10:
+            scored.append((digits, i))
+    if not scored:
+        return list(range(min(n, max_pages or n)))
+    best = sorted(scored, reverse=True)[: max_pages or len(scored)]
+    return sorted(i for _, i in best)
+
+
+def ocr_pdf(extractor, pdf_path, mode="auto", max_pages=8):
+    """OCR de las páginas elegidas de un PDF. Devuelve el JSON del formato C (ver paper_loader)."""
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(str(pdf_path))
+    try:
+        pages = select_table_pages(doc, mode, max_pages)
+        results = []
+        for idx in pages:
+            text = extractor.ocr_page(extractor.render_pdf_page(doc, idx))
+            html_tables = extractor.extract_html_tables(text)
+            md_tables = extractor.extract_markdown_tables(text) if not html_tables else []
+            tables = []
+            for h in html_tables:
+                cols, rows = extractor.parse_html_table(h)
+                if cols and rows:
+                    tables.append({"html": h, "columns": cols, "rows": rows})
+            for m in md_tables:
+                cols, rows = extractor.parse_markdown_table(m)
+                if cols and rows:
+                    tables.append({"html": None, "columns": cols, "rows": rows})
+            if tables:
+                results.append({"page": idx + 1, "tables": tables})
+        return {"file_name": Path(pdf_path).name, "pages_total": len(doc),
+                "pages_ocr": [i + 1 for i in pages], "results": results}
+    finally:
+        doc.close()
+
+
+def _valid_ocr_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return isinstance(json.load(f), dict)
+    except Exception:
+        return False
+
+
+def run_ocr(args, extractor=None):
+    """
+    Tablas con LightOnOCR para TODOS los papers con PDF (o solo el test con --ocr-test-only).
+    Todos los papers deben pasar por el mismo tratamiento: si solo unos tuvieran tablas, las
+    entradas del experimento no serían comparables entre ellos.
+    Reanudable: se salta los JSON válidos y rehace los corruptos.
+    """
     out_dir = Path(args.out_dir)
     ocr_dir = out_dir / "lightocr_jsons"
     ocr_dir.mkdir(parents=True, exist_ok=True)
     corpus = _load_corpus(out_dir)
-    targets = [r for r in corpus if r.get("local_pdf_path") and (args.ocr_pool or r["split"] == "test")]
-    parser = LightOcrParser()
-    for n, rec in enumerate(targets, 1):
-        out = ocr_dir / f"{safe_id(rec['arxiv_id'])}_lightonocr.json"
-        if not out.is_file():
+    targets = [r for r in corpus if (out_dir / "pdfs" / f"{safe_id(r['arxiv_id'])}.pdf").is_file()
+               and (not args.ocr_test_only or r["split"] == "test")]
+    todo = [r for r in targets
+            if not _valid_ocr_json(ocr_dir / f"{safe_id(r['arxiv_id'])}_lightonocr.json")]
+    n_pending = len(todo)                       # pendientes de toda la fase, antes de aplicar el límite
+    if args.ocr_limit:
+        todo = todo[: args.ocr_limit]
+    print(f"[ocr] {len(targets)} papers con PDF: {len(targets) - n_pending} ya hechos, {n_pending} pendientes"
+          + (f", se procesan {len(todo)} (--ocr-limit)" if len(todo) < n_pending else "")
+          + f" (páginas: {args.ocr_pages}, máx. {args.ocr_max_pages} por paper)", flush=True)
+    if not todo:
+        return
+
+    if extractor is None:
+        from parsers.extract_tables_lightonocr import LightOnOcrTableExtractor
+        extractor = LightOnOcrTableExtractor(pdf_dir=".", model_id=args.ocr_model)
+        extractor.load_models()
+
+    t_start, done, n_pages, n_tables, failed = time.time(), 0, 0, 0, 0
+    for rec in tqdm(todo, desc="[ocr] papers", unit="paper", mininterval=30):
+        sid = safe_id(rec["arxiv_id"])
+        try:
+            data = ocr_pdf(extractor, out_dir / "pdfs" / f"{sid}.pdf", args.ocr_pages, args.ocr_max_pages)
+        except Exception as e:  # p. ej. CUDA out of memory o un PDF corrupto: se sigue con el siguiente
+            failed += 1
+            print(f"[ocr] {rec['arxiv_id']}: {type(e).__name__}: {str(e)[:120]}", flush=True)
             try:
-                parser.process(rec["local_pdf_path"], str(out))
-            except Exception as e:
-                print(f"[ocr] {rec['arxiv_id']}: {e}")
-        if n % 25 == 0:
-            print(f"[ocr] {n}/{len(targets)}")
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            continue
+        _atomic_write_json(ocr_dir / f"{sid}_lightonocr.json", data, indent=None)
+        done += 1
+        n_pages += len(data["pages_ocr"])
+        n_tables += sum(len(p["tables"]) for p in data["results"])
+
+    el = time.time() - t_start
+    if done:
+        per_paper, per_page = el / done, el / max(1, n_pages)
+        print(f"[ocr] {done} papers, {n_pages} páginas, {n_tables} tablas, {failed} fallos en {el / 60:.1f} min", flush=True)
+        print(f"[ocr] {per_paper:.1f} s/paper, {per_page:.1f} s/página, {n_pages / done:.1f} páginas/paper, "
+              f"{n_tables / done:.1f} tablas/paper", flush=True)
+        if args.ocr_limit and n_pending > len(todo):
+            print(f"[ocr] ESTIMACIÓN para los {n_pending} papers pendientes: "
+                  f"{n_pending * per_paper / 3600:.1f} h (a {per_paper:.1f} s/paper)", flush=True)
 
 
 def _tei_title(xml_path):
@@ -702,7 +807,13 @@ def main():
     ap.add_argument("--contact", default="p2mc@oeg.upm.es", help="email de contacto en el User-Agent")
     ap.add_argument("--grobid-url", default="http://localhost:8070")
     ap.add_argument("--workers", type=int, default=4, help="peticiones simultáneas a GROBID")
-    ap.add_argument("--ocr-pool", action="store_true", help="aplicar OCR también al pool")
+    ap.add_argument("--ocr-test-only", action="store_true", help="ocr: solo los papers de test (por defecto, todos)")
+    ap.add_argument("--ocr-pages", choices=["auto", "all"], default="auto",
+                    help="ocr: 'auto' = solo páginas con pie de tabla (heurística); 'all' = todas")
+    ap.add_argument("--ocr-max-pages", type=int, default=8, help="ocr: máximo de páginas por paper")
+    ap.add_argument("--ocr-limit", type=int, default=None,
+                    help="ocr: procesar solo N papers y estimar el tiempo total (para medir antes de lanzarlo entero)")
+    ap.add_argument("--ocr-model", default="lightonai/LightOnOCR-2-1B")
     ap.add_argument("--check-titles", action="store_true",
                     help="prune: además, descarta papers cuyo título en el XML no coincide con el del GT (tras 'grobid')")
     ap.add_argument("--title-threshold", type=int, default=70, help="prune: similitud mínima de títulos (0-100)")

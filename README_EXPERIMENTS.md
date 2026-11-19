@@ -14,7 +14,6 @@ Hay dos perfiles de dataset (`config.DATASETS`), que se eligen con `--dataset`:
 ### Construir el corpus heterogéneo
 
 ```bash
-pip install datasets requests
 python build_dataset.py select      # GT desde pwc-archive + partición
 python build_dataset.py pdfs        # PDFs de arXiv (3 s entre peticiones: ~1 h por cada 1.000 papers)
 python build_dataset.py grobid      # TEI XML (GROBID en localhost:8070)
@@ -46,10 +45,29 @@ Principios:
 - La base de casos de umbral N se construye con las N primeras predicciones `llm` de una ordenación aleatoria del pool; se repite con 3 semillas.
 - Los tiempos excluyen la carga de modelos (calentamiento previo, `keep_alive`) y las consultas de red (SemOpenAlex, LPWC), que no forman parte de la extracción.
 
+## Entorno
+
+Todas las dependencias están fijadas en `environment.yml` (solo conda-forge, Python 3.11). Ollama no va dentro: se instala y se lanza aparte.
+
+```bash
+conda env create -f environment.yml
+conda activate p2mc-nesy
+```
+
+- `scikit-learn` está fijado a **1.5.0 exacto** porque `utils/taxonomy_classifier.joblib` se serializó con esa versión; con cualquier otra scikit-learn avisa al cargarlo.
+- Se instala `pytorch-cpu`: basta para los embeddings de la base de casos (all-MiniLM-L6-v2). Solo la fase `build_dataset.py ocr` (LightOnOCR) necesita GPU; para ella ejecuta `conda install -n p2mc-nesy pytorch-gpu` o crea un entorno aparte.
+- Actualizar el entorno tras cambiar `environment.yml`: `conda env update -f environment.yml --prune`.
+- Para congelar las versiones exactas con las que salieron los resultados del paper, súbelas al repo:
+  ```bash
+  conda list --explicit > conda-explicit-linux-64.txt     # recrea el entorno idéntico: conda create -n p2mc-nesy --file conda-explicit-linux-64.txt
+  pip freeze | grep -i ollama                            # versión exacta del cliente de Ollama
+  ```
+- Si `conda` tarda mucho en resolver, `mamba`/`micromamba` aceptan los mismos comandos.
+
 ## Cómo ejecutarlo
 
 ```bash
-pip install -r requirements.txt
+conda env create -f environment.yml && conda activate p2mc-nesy
 ollama pull qwen3.5:9b && ollama pull qwen3.5:2b          # gen2026
 ollama pull llama3.1:8b && ollama pull qwen2.5:7b && ollama pull qwen2.5:1.5b   # gen2024
 

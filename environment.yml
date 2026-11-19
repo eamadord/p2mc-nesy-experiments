@@ -1,0 +1,40 @@
+# Entorno de los experimentos P2MC-NeSy.
+#
+#   conda env create -f environment.yml
+#   conda activate p2mc-nesy
+#
+# Solo conda-forge (sin "defaults"): evita mezclar canales y sus licencias.
+# Ollama (servidor de LLMs) NO va aquí: se instala y se lanza aparte.
+name: p2mc-nesy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11            # el servidor usa 3.11.x
+  # --- núcleo de experiment_cbr.py / evaluate_predictions.py ---
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn=1.5.0     # versión EXACTA con la que se serializó taxonomy_classifier.joblib
+  - joblib
+  - rapidfuzz
+  - beautifulsoup4
+  - lxml
+  - matplotlib-base
+  - tabulate               # summary.md
+  - requests
+  # --- embeddings de la base de casos (all-MiniLM-L6-v2) ---
+  # pytorch-cpu basta: son ~5.000 abstracts. Para la fase OCR de build_dataset.py
+  # (LightOnOCR) hace falta GPU: ver README_EXPERIMENTS.md, apartado "Entorno".
+  - pytorch-cpu
+  - sentence-transformers
+  # --- build_dataset.py ---
+  - datasets               # descarga de pwc-archive
+  - pyarrow
+  - pypdfium2              # solo fase OCR
+  - pillow                 # solo fase OCR
+  - transformers           # solo fase OCR
+  # --- desarrollo ---
+  - pyflakes
+  - pip
+  - pip:
+      - ollama>=0.6        # cliente de Ollama: necesita `think` y `format` con esquema JSON

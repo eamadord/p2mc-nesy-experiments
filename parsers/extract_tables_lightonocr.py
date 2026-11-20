@@ -154,7 +154,7 @@ class LightOnOcrTableExtractor:
         self._model = LightOnOcrForConditionalGeneration.from_pretrained(
             self.model_id,
             torch_dtype=self._dtype,
-            attn_implementation="eager",
+            attn_implementation=os.environ.get("LIGHTONOCR_ATTN", "eager"),   # eager (por defecto), sdpa, flash_attention_2
         ).to(self._device)
         log.info("OCR model loaded: %s", self.model_id)
 

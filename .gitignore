@@ -8,3 +8,5 @@ data/case_base/
 data/raw/
 data/interim/
 .env
+logs/
+testing_data_hetero/pdfs/

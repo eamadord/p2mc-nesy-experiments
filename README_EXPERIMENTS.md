@@ -30,8 +30,8 @@ Los datasets y las métricas viven en las tablas de resultados, así que las ent
 LightOnOCR procesa cada página como una imagen con un modelo de 1.000 millones de parámetros, así que es la fase más cara. Para que sea viable, por defecto solo se envían las páginas que **parecen tener una tabla**: las que en la capa de texto del PDF tienen un pie de tabla ("Table 3:") al inicio de línea y al menos 10 números, hasta 8 por paper (`--ocr-pages all` las procesa todas). Es una heurística comprobada con PDFs sintéticos, no con PDFs reales de arXiv: conviene revisar a mano unos cuantos papers.
 
 ```bash
-python build_dataset.py ocr --ocr-limit 5      # primero 5 papers: imprime s/paper y la estimación en horas
-python build_dataset.py ocr                    # luego todos; reanudable
+/opt/conda/envs/p2mc-ocr/bin/python build_dataset.py ocr --ocr-limit 5   # primero 5 papers: imprime s/paper y la estimación en horas
+/opt/conda/envs/p2mc-ocr/bin/python build_dataset.py ocr                 # luego todos; reanudable
 ```
 
 La fase es reanudable (se salta los JSON válidos y rehace los corruptos), sigue si un paper falla y no necesita GROBID, así que puede ejecutarse a la vez que él. El cargador del experimento lee tanto el formato de los JSON de `testing_data/` como el de `LightOcrParser` y el de esta fase.
@@ -70,7 +70,19 @@ conda activate p2mc-nesy
 ```
 
 - `scikit-learn` está fijado a **1.5.0 exacto** porque `utils/taxonomy_classifier.joblib` se serializó con esa versión; con cualquier otra scikit-learn avisa al cargarlo.
-- Se instala `pytorch-cpu`: basta para los embeddings de la base de casos (all-MiniLM-L6-v2). Solo la fase `build_dataset.py ocr` (LightOnOCR) necesita GPU: úsala en un entorno aparte, `conda create -n p2mc-ocr --clone p2mc-nesy` y `conda install -n p2mc-ocr -c conda-forge pytorch-gpu`, para no tocar el entorno de los experimentos.
+- Se instala `pytorch-cpu`: basta para los embeddings de la base de casos (all-MiniLM-L6-v2). Solo la fase `build_dataset.py ocr` (LightOnOCR) necesita GPU, y usa un entorno aparte, `environment-ocr.yml` (unos 4 GB), para no tocar el de los experimentos. No lo crees clonando `p2mc-nesy` e instalando `pytorch-gpu`: el solver clásico de conda se queda atascado en "solving environment". Con micromamba resuelve en segundos:
+
+  ```bash
+  conda create -n mm -c conda-forge micromamba -y
+  # En redes que cortan muchas conexiones pequeñas ("SSL connect error ... Connection reset by peer"):
+  export MAMBA_USE_SHARDED_REPODATA=false MAMBA_DOWNLOAD_THREADS=1 MAMBA_REMOTE_CONNECT_TIMEOUT_SECS=60
+  /opt/conda/envs/mm/bin/micromamba create -r /opt/conda -n p2mc-ocr -f environment-ocr.yml -y
+  /opt/conda/envs/p2mc-ocr/bin/python -c "import torch; print(torch.cuda.is_available())"   # debe dar True
+  ```
+
+  `MAMBA_USE_SHARDED_REPODATA` debe valer `false` (con `0` micromamba da un error de conversión): así descarga el índice completo del canal en vez de cientos de ficheros pequeños, que es lo que cortaba la red.
+
+  El `/opt/conda` de esas órdenes es la instalación de conda de este servidor (`conda info --base`). Después, la fase se lanza con `/opt/conda/envs/p2mc-ocr/bin/python build_dataset.py ocr`.
 - Actualizar el entorno tras cambiar `environment.yml`: `conda env update -f environment.yml --prune`.
 - Para congelar las versiones exactas con las que salieron los resultados del paper, súbelas al repo:
   ```bash
@@ -78,6 +90,33 @@ conda activate p2mc-nesy
   pip freeze | grep -i ollama                            # versión exacta del cliente de Ollama
   ```
 - Si `conda` tarda mucho en resolver, `mamba`/`micromamba` aceptan los mismos comandos.
+
+## Sesiones que se cierran
+
+En el servidor, cada cierto tiempo la sesión se cierra y se pierde todo lo que no está en el disco personal: los entornos de `/opt/conda` y los procesos en marcha. `scripts/p2mc.sh` lo resuelve:
+
+- Los entornos y la caché de paquetes viven en `~/micromamba` (persistente). Recrear un entorno tras un cierre enlaza desde la caché, sin volver a descargar.
+- Cada fase corre bajo un supervisor que la reintenta si falla y que la recuerda como "pendiente" hasta que termina bien.
+
+```bash
+cd ~/p2mc-nesy-experiments && git pull
+bash scripts/p2mc.sh bootstrap                # una vez: crea p2mc-nesy, p2mc-ocr y grobid (en el disco persistente)
+
+bash scripts/p2mc.sh start pdfs
+bash scripts/p2mc.sh start grobid             # arranca antes el servidor GROBID y espera a que escuche
+bash scripts/p2mc.sh start ocr --ocr-test-only --ocr-max-pages 3
+bash scripts/p2mc.sh start experiment         # arranca antes Ollama y espera a que escuche
+```
+
+**Tras cada cierre de sesión**, un solo comando recrea los entornos que falten y relanza lo que no había terminado:
+
+```bash
+cd ~/p2mc-nesy-experiments && bash scripts/p2mc.sh resume
+```
+
+Otras órdenes: `status` (qué corre, qué datos hay, qué falta), `logs <fase>`, `stop [fase|all]`. Fases: `ollama`, `grobid-server`, `pdfs`, `grobid`, `ocr`, `prune`, `experiment`. Los logs quedan en `logs/`.
+
+Todo lo que debe sobrevivir tiene que estar en tu carpeta personal: el repositorio, `~/micromamba`, `~/grobid` (compilado), `~/.local` (Ollama), `~/.ollama` (modelos) y `~/.cache/huggingface`. Comprueba tras el primer cierre que `ls ~/micromamba` sigue ahí; si no, ese disco no es persistente y hay que apuntar `P2MC_MAMBA_ROOT` a otro que lo sea.
 
 ## Cómo ejecutarlo
 

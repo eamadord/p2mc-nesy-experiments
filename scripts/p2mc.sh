@@ -51,6 +51,10 @@ ENVS="p2mc-nesy p2mc-ocr grobid"
 # shellcheck disable=SC1091
 [ -f "$STATE/env" ] && . "$STATE/env"
 
+# Los paquetes instalados con "pip --user" (~/.local) tapan a los del entorno y rompen la
+# reproducibilidad: con esto, cada fase usa solo lo que fija su environment*.yml.
+export PYTHONNOUSERSITE=1
+
 # Redes que cortan muchas conexiones pequeñas: índice completo del canal y una descarga a la vez.
 export MAMBA_ROOT_PREFIX="$ROOT"
 export MAMBA_USE_SHARDED_REPODATA=false MAMBA_DOWNLOAD_THREADS=1 MAMBA_REMOTE_CONNECT_TIMEOUT_SECS=60

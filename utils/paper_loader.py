@@ -244,13 +244,14 @@ def load_corpus(data_dir="testing_data", category_field="model_category", verbos
             skipped += 1
             continue
 
-        tables_tsv = ""
+        tables_tsv, has_ocr = "", False
         if ocr_dir is not None:
             ocr_path = ocr_dir / f"{arxiv_id}_lightonocr.json"
             if ocr_path.is_file():
                 try:
                     with open(ocr_path, encoding="utf-8") as f:
                         tables_tsv = ocr_to_tsv(json.load(f))
+                    has_ocr = True            # el OCR se hizo (aunque no encontrara ninguna tabla)
                 except Exception:
                     tables_tsv = ""
         with_tables += bool(tables_tsv)
@@ -264,6 +265,7 @@ def load_corpus(data_dir="testing_data", category_field="model_category", verbos
             "full_text": full_text,
             "sections": sections,
             "tables_tsv": tables_tsv,
+            "has_ocr": has_ocr,
             "gt": ground_truth_of(paper, category_field),
             "area": paper.get("area"),
             "split": paper.get("split"),

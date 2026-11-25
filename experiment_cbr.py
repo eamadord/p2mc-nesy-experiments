@@ -91,6 +91,11 @@ def prepare(args):
         split_path.write_text(json.dumps(split, indent=1))
     split = json.loads(split_path.read_text())
     print(f"[prepare] test={len(split['test'])} pool={len(split['pool'])}")
+    by_id = {p["arxiv_id"]: p for p in corpus}
+    ocr_test = sum(1 for i in split["test"] if by_id[i].get("has_ocr"))
+    ocr_pool = sum(1 for i in split["pool"] if by_id[i].get("has_ocr"))
+    print(f"[prepare] con OCR: test={ocr_test}/{len(split['test'])} pool={ocr_pool}/{len(split['pool'])}"
+          " (las tablas se guardan AHORA: si el OCR no ha terminado, repite con --force)")
     if max(EXP["thresholds"]) > len(split["pool"]):
         print(f"[prepare] AVISO: el umbral máximo ({max(EXP['thresholds'])}) supera el pool.")
 
@@ -106,6 +111,9 @@ def prepare(args):
         np.savez(emb_path, ids=np.array([p["arxiv_id"] for p in corpus]), emb=emb)
 
 
+POOL_OCR_ONLY = False   # se fija en main() con --pool-ocr-only
+
+
 def load_state():
     corpus = {p["arxiv_id"]: p for p in _read_jsonl(CACHE / "corpus.jsonl")}
     if not corpus:
@@ -113,6 +121,18 @@ def load_state():
     split = json.loads((OUT / "split.json").read_text())
     z = np.load(CACHE / f"embeddings_{EXP['embedder']}.npz")
     emb = {i: e for i, e in zip(z["ids"].tolist(), z["emb"])}
+    if POOL_OCR_ONLY:
+        # El pool se limita a los papers con OCR hecho, para que los casos de la base se hayan
+        # generado con las mismas entradas (tablas incluidas) que el test.
+        full = len(split["pool"])
+        split = {**split, "pool": [p for p in split["pool"] if corpus[p].get("has_ocr")]}
+        sin_ocr = sum(1 for p in split["test"] if not corpus[p].get("has_ocr"))
+        print(f"[pool] --pool-ocr-only: {len(split['pool'])} de {full} papers del pool tienen OCR", flush=True)
+        if sin_ocr:
+            print(f"[pool] AVISO: {sin_ocr} de {len(split['test'])} papers de test no tienen OCR", flush=True)
+        if split["pool"] and max(EXP["thresholds"]) > len(split["pool"]):
+            print(f"[pool] AVISO: el umbral máximo ({max(EXP['thresholds'])}) supera el pool con OCR; "
+                  "habrá menos casos de los previstos", flush=True)
     return corpus, split, emb
 
 
@@ -300,17 +320,29 @@ def main():
     ap.add_argument("--dataset", default=config.DEFAULT_DATASET, choices=sorted(config.DATASETS),
                     help="perfil de dataset (config.DATASETS)")
     ap.add_argument("--generation", default="gen2026", choices=sorted(config.GENERATIONS))
+    ap.add_argument("--pool-ocr-only", action="store_true",
+                    help="usar como pool solo los papers con OCR hecho (OCR parcial por fases)")
+    ap.add_argument("--thresholds", type=int, nargs="+", default=None, metavar="N",
+                    help="tamaños de la base de casos (por defecto los de config.py); p. ej. --thresholds 100 500")
+    ap.add_argument("--seeds", type=int, nargs="+", default=None, metavar="S",
+                    help="semillas de ordenación del pool (por defecto las de config.py); p. ej. --seeds 0")
     ap.add_argument("--k", type=int, default=None, help="casos recuperados (por defecto config.EXPERIMENT['k'])")
     ap.add_argument("--mock", action="store_true", help="backend simulado, sin GPU")
     ap.add_argument("--force", action="store_true", help="regenera corpus/partición/embeddings en 'prepare'")
     args = ap.parse_args()
 
-    global EXP, OUT, CACHE
+    global EXP, OUT, CACHE, POOL_OCR_ONLY
+    POOL_OCR_ONLY = args.pool_ocr_only
     EXP = config.dataset_profile(args.dataset)
+    if args.thresholds:
+        EXP["thresholds"] = sorted(set(args.thresholds))
+    if args.seeds is not None:
+        EXP["seeds"] = list(dict.fromkeys(args.seeds))
     base = EXP["out_dir"] + ("_mock" if args.mock else "")   # lo simulado nunca se mezcla con lo real
     OUT = Path(base) / EXP["name"]
     CACHE = OUT / "cache"
     print(f"[config] dataset={EXP['name']}  generación={args.generation}  resultados en {OUT}/")
+    print(f"[config] umbrales={EXP['thresholds']}  semillas={EXP['seeds']}  k={args.k or EXP['k']}")
     if args.mock:
         print("[mock] backend simulado: resultados sin significado")
 

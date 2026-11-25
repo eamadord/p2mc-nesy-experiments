@@ -16,10 +16,12 @@
 #   bash scripts/p2mc.sh start <fase> [args...]   lanza una fase en segundo plano con reintentos
 #   bash scripts/p2mc.sh resume                   relanza las fases que no habían terminado
 #   bash scripts/p2mc.sh status                   qué está en marcha, qué datos hay y qué falta
+#   bash scripts/p2mc.sh smoke [--n 3]            prueba de humo del pipeline con el Ollama real
+#   bash scripts/p2mc.sh evaluate                 evalúa las predicciones guardadas (vale con resultados parciales)
 #   bash scripts/p2mc.sh logs <fase>              sigue el log de una fase
 #   bash scripts/p2mc.sh stop [fase|all]          para una fase (y la quita de pendientes)
 #
-# Fases: ollama grobid-server pdfs grobid ocr prune experiment
+# Fases: ollama grobid-server pdfs grobid ocr prune prepare experiment
 # Ejemplos:
 #   bash scripts/p2mc.sh start ocr --ocr-test-only --ocr-max-pages 3
 #   bash scripts/p2mc.sh start grobid           # arranca antes GROBID y espera a que escuche
@@ -39,8 +41,15 @@ OLLAMA_BIN="${OLLAMA_BIN:-$HOME/.local/bin/ollama}"
 DATASET="${P2MC_DATASET:-hetero}"
 GENERATION="${P2MC_GENERATION:-gen2026}"
 DATA_DIR="${P2MC_DATA_DIR:-$REPO/testing_data_hetero}"
-PHASES="ollama grobid-server pdfs grobid ocr prune experiment"   # orden de reanudación
+PHASES="ollama grobid-server pdfs grobid ocr prune prepare experiment"   # orden de reanudación
 ENVS="p2mc-nesy p2mc-ocr grobid"
+
+# Variables que deben sobrevivir a los cierres de sesión y aplicarse a todas las fases (por ejemplo
+# LIGHTONOCR_ATTN=sdpa). Un "export" en el terminal se pierde al cerrarse la sesión y "resume" no
+# lo recordaría; las que están en este fichero, sí:
+#     echo 'export LIGHTONOCR_ATTN=sdpa' >> ~/.p2mc/env
+# shellcheck disable=SC1091
+[ -f "$STATE/env" ] && . "$STATE/env"
 
 # Redes que cortan muchas conexiones pequeñas: índice completo del canal y una descarga a la vez.
 export MAMBA_ROOT_PREFIX="$ROOT"
@@ -141,7 +150,7 @@ run_phase() {
       export JAVA_HOME; JAVA_HOME="$(env_dir grobid)/lib/jvm"
       export PATH="$JAVA_HOME/bin:$PATH"
       cd "$GROBID_DIR" && ./gradlew --console=plain run ;;
-    pdfs|grobid|prune|ocr|experiment)
+    pdfs|grobid|prune|prepare|ocr|experiment)
       envname=p2mc-nesy; [ "$phase" = ocr ] && envname=p2mc-ocr
       ensure_env "$envname" || return 2
       py="$(env_dir "$envname")/bin/python"
@@ -151,9 +160,12 @@ run_phase() {
         grobid)     need_service grobid-server 8070 900 || return 3
                     "$py" build_dataset.py grobid --workers 4 "$@" ;;
         prune)      "$py" build_dataset.py prune "$@" ;;
+        prepare)    export HF_HUB_DOWNLOAD_TIMEOUT=60 HF_HUB_ETAG_TIMEOUT=60 HF_HUB_DISABLE_XET=1
+                    "$py" experiment_cbr.py prepare --dataset "$DATASET" --force "$@" ;;
         ocr)        export HF_HUB_DOWNLOAD_TIMEOUT=60 HF_HUB_ETAG_TIMEOUT=60 HF_HUB_DISABLE_XET=1
                     "$py" build_dataset.py ocr "$@" ;;
         experiment) need_service ollama 11434 120 || return 3
+                    export HF_HUB_DOWNLOAD_TIMEOUT=60 HF_HUB_ETAG_TIMEOUT=60 HF_HUB_DISABLE_XET=1
                     "$py" experiment_cbr.py all --dataset "$DATASET" --generation "$GENERATION" "$@" ;;
       esac ;;
     *) say "fase desconocida: $phase"; return 2 ;;
@@ -241,6 +253,9 @@ cmd_status() {
     printf '\n'
     [ -f "$LOGS/$p.log" ] && printf '                 último log: %s\n' "$(tail -n 1 "$LOGS/$p.log" | cut -c1-100)"
   done
+  if [ -s "$STATE/env" ]; then
+    echo "== Variables fijas ($STATE/env) =="; grep -v '^#' "$STATE/env" | sed 's/^/  /'
+  fi
   echo "== Servicios =="
   port_open 11434 && echo "  ollama (11434): escuchando" || echo "  ollama (11434): NO"
   port_open 8070  && echo "  grobid (8070):  escuchando" || echo "  grobid (8070):  NO"
@@ -253,6 +268,17 @@ cmd_status() {
   echo "== Disco =="; df -h "$HOME" | tail -1
 }
 
+cmd_smoke() {         # prueba de humo con el Ollama real (en primer plano, no supervisada)
+  ensure_env p2mc-nesy || die "no se pudo crear el entorno p2mc-nesy"
+  need_service ollama 11434 120 || die "Ollama no escucha en el puerto 11434"
+  cd "$REPO" && "$(env_dir p2mc-nesy)/bin/python" scripts/smoke_test.py --dataset "$DATASET" --generation "$GENERATION" "$@"
+}
+
+cmd_evaluate() {      # evalúa las predicciones guardadas (rápido; se puede hacer con resultados parciales)
+  ensure_env p2mc-nesy || die "no se pudo crear el entorno p2mc-nesy"
+  cd "$REPO" && "$(env_dir p2mc-nesy)/bin/python" evaluate_predictions.py --dataset "$DATASET" "$@"
+}
+
 usage() { sed -n '2,/^set -uo/p' "$SELF" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
@@ -261,6 +287,8 @@ case "${1:-help}" in
   resume)    cmd_resume ;;
   stop)      shift; cmd_stop "${1:-all}" ;;
   status)    cmd_status ;;
+  smoke)     shift; cmd_smoke "$@" ;;
+  evaluate)  shift; cmd_evaluate "$@" ;;
   logs)      tail -n 40 -f "$LOGS/${2:?uso: logs <fase>}.log" ;;
   _supervise) shift; _supervise "$@" ;;
   *)         usage ;;

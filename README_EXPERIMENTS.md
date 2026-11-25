@@ -34,6 +34,22 @@ LightOnOCR procesa cada página como una imagen con un modelo de 1.000 millones 
 /opt/conda/envs/p2mc-ocr/bin/python build_dataset.py ocr                 # luego todos; reanudable
 ```
 
+**OCR por fases.** Si el OCR de todo el pool tarda demasiado, se puede hacer solo una parte y ampliarlo después. `--ocr-pool-limit N` procesa todo el test y los primeros N papers del pool **en orden equilibrado por área** (el pool de `pwc_final.json` está agrupado por área, y sus primeros N serían de una sola). El umbral mayor de la pasada necesita unos `1,05 × umbral + 5` papers de pool: 530 para los umbrales 100 y 500, y 2.105 para el 2.000.
+
+```bash
+# Fase 1: test + 530 del pool (la pasada piloto)
+bash scripts/p2mc.sh start ocr --ocr-pool-limit 530
+# ... cuando termine el OCR, y también GROBID y prune:
+python experiment_cbr.py prepare --dataset hetero --force     # las tablas se guardan AHORA
+bash scripts/p2mc.sh start experiment --pool-ocr-only         # el pool se limita a los papers con tablas
+```
+
+Tres cosas a tener en cuenta:
+
+- `prepare` guarda en su caché las tablas que existan **en ese momento**: el OCR debe haber terminado antes, y si se amplía después hay que repetir `prepare --force`.
+- `--pool-ocr-only` es necesario: sin él el experimento elige el pool al azar entre todos y la mayoría de los casos no tendrían tablas.
+- Al ampliar el OCR (por ejemplo `--ocr-pool-limit 2105`), el pool cambia y con él los casos de cada umbral. Borra antes las predicciones de la ruta CBR (`results/hetero/<generación>/predictions/cbr_*` y `retrieval_only_*`); `llm.jsonl` y `small.jsonl` no dependen del pool y se reutilizan.
+
 La fase es reanudable (se salta los JSON válidos y rehace los corruptos), sigue si un paper falla y no necesita GROBID, así que puede ejecutarse a la vez que él. El cargador del experimento lee tanto el formato de los JSON de `testing_data/` como el de `LightOcrParser` y el de esta fase.
 
 Por defecto: las 8 áreas con más papers completos (sin "Methodology" ni "Miscellaneous"), 75 papers de test y 300 de pool por área. Se puede cambiar con `--areas`, `--n-test-per-area`, `--n-pool-per-area`, `--min-year` y `--repo-policy official`.
@@ -117,6 +133,37 @@ cd ~/p2mc-nesy-experiments && bash scripts/p2mc.sh resume
 Otras órdenes: `status` (qué corre, qué datos hay, qué falta), `logs <fase>`, `stop [fase|all]`. Fases: `ollama`, `grobid-server`, `pdfs`, `grobid`, `ocr`, `prune`, `experiment`. Los logs quedan en `logs/`.
 
 Todo lo que debe sobrevivir tiene que estar en tu carpeta personal: el repositorio, `~/micromamba`, `~/grobid` (compilado), `~/.local` (Ollama), `~/.ollama` (modelos) y `~/.cache/huggingface`. Comprueba tras el primer cierre que `ls ~/micromamba` sigue ahí; si no, ese disco no es persistente y hay que apuntar `P2MC_MAMBA_ROOT` a otro que lo sea.
+
+## Lanzar los experimentos (tras el OCR)
+
+Todo con `bash scripts/p2mc.sh` desde la raíz del repo. Cada paso tiene su comprobación: no pases al siguiente si no se cumple.
+
+```bash
+# 0. Estado y GPU libre. Las mediciones de tiempo solo valen si nada más usa la GPU.
+bash scripts/p2mc.sh status
+bash scripts/p2mc.sh stop ocr
+
+# 1. GROBID y limpieza del corpus (si aún no está hecho: PDFs y XML deben ser casi los mismos)
+bash scripts/p2mc.sh start grobid               # reanudable
+bash scripts/p2mc.sh start prune --check-titles # descarta papers cuyo PDF no es el del ground truth
+bash scripts/p2mc.sh stop grobid-server         # ya no hace falta: libera CPU
+
+# 2. Preparar: guarda las tablas del OCR y calcula los embeddings
+bash scripts/p2mc.sh start prepare              # debe mostrar "con OCR: test=N/N pool=M/M"
+
+# 3. Prueba de humo con el Ollama real (3 papers, rutas llm y small)
+bash scripts/p2mc.sh smoke                      # debe acabar en "RESULTADO: OK"
+
+# 4. Pasada piloto: 2 umbrales y 1 semilla
+bash scripts/p2mc.sh start experiment --thresholds 100 500 --seeds 0
+bash scripts/p2mc.sh logs experiment
+
+# 5. Evaluar (vale con resultados parciales)
+bash scripts/p2mc.sh evaluate
+cat results/hetero/summary.md
+```
+
+La pasada piloto procesa con la ruta `llm` unos 1.100 papers (el test y unos 530 del pool). La prueba de humo da los segundos por paper de cada ruta: multiplícalos para estimar el tiempo. Para ampliar a la configuración completa, relanza sin `--thresholds` ni `--seeds` (usa los de `config.py`) o con `--thresholds 100 500 1000 2000 --seeds 0 1 2`. Lo ya calculado se reutiliza, pero hay que borrar antes las predicciones `cbr_*` y `retrieval_only_*` si cambia el pool. Con el OCR de todos los papers hecho no hace falta `--pool-ocr-only`; `prepare` muestra cuántos tienen OCR.
 
 ## Cómo ejecutarlo
 

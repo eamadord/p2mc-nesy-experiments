@@ -71,6 +71,27 @@ env_ok() {
   esac
 }
 
+# Comprobación estricta: además de que exista el Python, el entorno de los experimentos debe poder
+# importar "ollama". Se instala con la sección "pip" de environment.yml, y esa parte puede fallar
+# (por ejemplo, sin acceso a PyPI) sin que falle la de conda: el entorno existe pero está incompleto.
+env_verify() {
+  env_ok "$1" || return 1
+  case "$1" in
+    p2mc-nesy) "$(env_dir p2mc-nesy)/bin/python" -c "import ollama" 2>/dev/null ;;
+    *)         return 0 ;;
+  esac
+}
+
+# Repara un entorno incompleto sin recrearlo (evita volver a enlazar varios GB).
+env_repair() {
+  case "$1" in
+    p2mc-nesy)
+      say "al entorno 'p2mc-nesy' le falta 'ollama': lo instalo con pip"
+      "$(env_dir p2mc-nesy)/bin/python" -m pip install "ollama>=0.6" ;;
+    *) return 1 ;;
+  esac
+}
+
 get_mm() {
   [ -x "$MM" ] && return 0
   say "descargando micromamba $MM_VERSION a $BINDIR ..."
@@ -93,7 +114,11 @@ PY
 
 ensure_env() {
   local name="$1" i
-  env_ok "$name" && return 0
+  env_verify "$name" && return 0
+  if env_ok "$name" && env_repair "$name" && env_verify "$name"; then
+    say "entorno '$name' reparado"; return 0
+  fi
+  if env_ok "$name"; then say "no se pudo reparar '$name': lo recreo"; fi
   get_mm || return 1
   say "creando el entorno '$name' en $ROOT/envs (si ya se descargó antes, sale de la caché)"
   for i in 1 2 3 4 5; do
@@ -104,7 +129,8 @@ ensure_env() {
       grobid)    "$MM" create -n "$name" -c conda-forge --override-channels openjdk=11 -y ;;
       *)         say "entorno desconocido: $name"; return 1 ;;
     esac
-    if env_ok "$name"; then say "entorno '$name' listo"; return 0; fi
+    if env_verify "$name"; then say "entorno '$name' listo"; return 0; fi
+    if env_ok "$name" && env_repair "$name" && env_verify "$name"; then say "entorno '$name' listo (reparado)"; return 0; fi
     say "intento $i fallido; reintento en 20 s"; sleep 20
   done
   say "no se pudo crear el entorno '$name'"; return 1
@@ -264,7 +290,11 @@ cmd_status() {
   port_open 11434 && echo "  ollama (11434): escuchando" || echo "  ollama (11434): NO"
   port_open 8070  && echo "  grobid (8070):  escuchando" || echo "  grobid (8070):  NO"
   echo "== Entornos en $ROOT/envs =="
-  for p in $ENVS; do env_ok "$p" && echo "  $p: ok" || echo "  $p: NO existe (bootstrap lo crea)"; done
+  for p in $ENVS; do
+    if env_verify "$p"; then echo "  $p: ok"
+    elif env_ok "$p"; then echo "  $p: INCOMPLETO (falta ollama; 'bootstrap $p' lo repara)"
+    else echo "  $p: NO existe (bootstrap lo crea)"; fi
+  done
   echo "== Datos en $DATA_DIR =="
   echo "  PDFs: $(count "$DATA_DIR/pdfs" '*.pdf')   XML: $(count "$DATA_DIR/xml_outputs" '*.tei.xml')   OCR: $(count "$DATA_DIR/lightocr_jsons" '*.json')"
   local pred="$REPO/results/$DATASET/$GENERATION/predictions/llm.jsonl"

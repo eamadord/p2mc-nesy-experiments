@@ -92,8 +92,10 @@ def prepare(args):
     split = json.loads(split_path.read_text())
     print(f"[prepare] test={len(split['test'])} pool={len(split['pool'])}")
     by_id = {p["arxiv_id"]: p for p in corpus}
-    ocr_test = sum(1 for i in split["test"] if by_id[i].get("has_ocr"))
-    ocr_pool = sum(1 for i in split["pool"] if by_id[i].get("has_ocr"))
+    ocr_test = sum(1 for i in split["test"] if _ocr_done(i))
+    ocr_pool = sum(1 for i in split["pool"] if _ocr_done(i))
+    with_tables = sum(1 for i in split["test"] + split["pool"] if by_id[i].get("tables_tsv"))
+    print(f"[prepare] papers con tablas extraídas en la caché: {with_tables}/{len(split['test']) + len(split['pool'])}")
     print(f"[prepare] con OCR: test={ocr_test}/{len(split['test'])} pool={ocr_pool}/{len(split['pool'])}"
           " (las tablas se guardan AHORA: si el OCR no ha terminado, repite con --force)")
     if max(EXP["thresholds"]) > len(split["pool"]):
@@ -114,6 +116,15 @@ def prepare(args):
 POOL_OCR_ONLY = False   # se fija en main() con --pool-ocr-only
 
 
+def _ocr_done(arxiv_id):
+    """
+    ¿Existe el JSON de OCR de este paper? Se mira EN DISCO, no en un campo guardado en la caché del
+    corpus: así no depende de la versión de paper_loader ni de que la caché esté al día.
+    """
+    base = Path(EXP["data_dir"])
+    return any((base / d / f"{arxiv_id}_lightonocr.json").is_file() for d in ("lightocr_jsons", "lightocr_json"))
+
+
 def load_state():
     corpus = {p["arxiv_id"]: p for p in _read_jsonl(CACHE / "corpus.jsonl")}
     if not corpus:
@@ -125,8 +136,8 @@ def load_state():
         # El pool se limita a los papers con OCR hecho, para que los casos de la base se hayan
         # generado con las mismas entradas (tablas incluidas) que el test.
         full = len(split["pool"])
-        split = {**split, "pool": [p for p in split["pool"] if corpus[p].get("has_ocr")]}
-        sin_ocr = sum(1 for p in split["test"] if not corpus[p].get("has_ocr"))
+        split = {**split, "pool": [p for p in split["pool"] if _ocr_done(p)]}
+        sin_ocr = sum(1 for p in split["test"] if not _ocr_done(p))
         print(f"[pool] --pool-ocr-only: {len(split['pool'])} de {full} papers del pool tienen OCR", flush=True)
         if sin_ocr:
             print(f"[pool] AVISO: {sin_ocr} de {len(split['test'])} papers de test no tienen OCR", flush=True)

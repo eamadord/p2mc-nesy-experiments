@@ -27,11 +27,11 @@ import numpy as np
 import pandas as pd
 
 import config
-from utils.evaluation_tools import PRIMARY_METRIC, bertscore_name, score_paper
+from utils.evaluation_tools import DEFAULT_TASK_THRESHOLD, PRIMARY_METRIC, bertscore_name, score_paper
 
 RESOURCE_COLS = ["extraction_wall_s", "llm_compute_s", "llm_load_s", "prompt_tokens",
                  "gen_tokens", "llm_calls", "llm_failed_calls", "retrieval_s"]
-FIELD_ORDER = ["name", "category", "tasks", "tasks_invocab", "repo", "datasets", "metrics"]
+FIELD_ORDER = ["name", "category", "tasks", "tasks_exact", "repo", "datasets", "metrics"]
 
 _CFG_RE = re.compile(r"^(?P<route>retrieval_only|cbr)_(?:(?P<gtloo>gtloo)|t(?P<thr>\d+)_s(?P<seed>\d+))(?:_k(?P<k>\d+))?$")
 
@@ -72,7 +72,7 @@ def wilcoxon_p(diffs):
         return math.nan
 
 
-def load_scores(results_dir, profile, use_bertscore=False):
+def load_scores(results_dir, profile, use_bertscore=False, task_threshold=DEFAULT_TASK_THRESHOLD):
     results_dir = Path(results_dir)
     corpus_path = results_dir / "cache" / "corpus.jsonl"
     split = json.loads((results_dir / "split.json").read_text())
@@ -84,8 +84,6 @@ def load_scores(results_dir, profile, use_bertscore=False):
             area[p["arxiv_id"]] = p.get("area")
             if p["arxiv_id"] in test:
                 gt[p["arxiv_id"]] = p["gt"]
-    with open(profile["tasks_vocab"], encoding="utf-8") as f:
-        task_vocab = [t["name"] for t in json.load(f)]
     labelset = config.category_labelset(profile)
 
     rows = []
@@ -103,7 +101,7 @@ def load_scores(results_dir, profile, use_bertscore=False):
                     pid = r["arxiv_id"]
                     if pid not in gt:      # llm.jsonl también contiene el pool
                         continue
-                    s = score_paper(r["fields"], gt[pid], task_vocab=task_vocab, labelset=labelset)
+                    s = score_paper(r["fields"], gt[pid], labelset=labelset, task_threshold=task_threshold)
                     if use_bertscore:
                         s["name_bertscore"] = bertscore_name(r["fields"].get("name"), gt[pid].get("name"))
                     u = r.get("usage", {})
@@ -263,6 +261,9 @@ def main():
     ap.add_argument("--dataset", default=config.DEFAULT_DATASET, choices=sorted(config.DATASETS))
     ap.add_argument("--results", default="results", help="carpeta base (results o results_mock)")
     ap.add_argument("--margin", type=float, default=0.05, help="margen de no inferioridad (puntos absolutos)")
+    ap.add_argument("--task-threshold", type=float, default=DEFAULT_TASK_THRESHOLD,
+                    help="solapamiento mínimo (Dice, 0-1) para dar dos tareas por la misma; 1 = mismas palabras. "
+                         "Provisional: decídelo con scripts/tasks_threshold_report.py")
     ap.add_argument("--bertscore", action="store_true", help="añade BERTScore reescalado para el nombre")
     args = ap.parse_args()
 
@@ -273,7 +274,8 @@ def main():
             f"No hay resultados en {out}/ (falta split.json).\n"
             f"Ejecuta primero: python experiment_cbr.py all --dataset {profile['name']} "
             "[--generation gen2026]")
-    df, n_test = load_scores(out, profile, use_bertscore=args.bertscore)
+    df, n_test = load_scores(out, profile, use_bertscore=args.bertscore, task_threshold=args.task_threshold)
+    print(f"[eval] tareas: coincidencia por solapamiento >= {args.task_threshold} (columna tasks_f1) y exacta tras normalizar (tasks_exact_f1)")
     if df.empty:
         raise SystemExit("No hay predicciones que evaluar.")
     df.to_csv(out / "scores_per_paper.csv", index=False)

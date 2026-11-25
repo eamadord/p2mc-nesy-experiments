@@ -165,11 +165,87 @@ def normalize_url(url):
     return s
 
 
+def _singular(tok):
+    """Singular inglés sencillo, solo para comparar: embeddings = embedding, queries = query."""
+    if len(tok) > 4 and tok.endswith("ies"):
+        return tok[:-3] + "y"
+    if len(tok) > 4 and tok.endswith(("sses", "xes", "ches", "shes", "zes")):
+        return tok[:-2]
+    if len(tok) > 3 and tok.endswith("s") and not tok.endswith(("ss", "us", "is", "as")):
+        return tok[:-1]
+    return tok
+
+
 def normalize_task(task):
+    """
+    Normalización de una tarea ABIERTA para compararla con el ground truth: sin acentos, minúsculas,
+    sin puntuación ni guiones y en singular. Es lo único que se hace: no hay vocabulario ni
+    coincidencias aproximadas. "Link Prediction" = "link prediction"; "Knowledge Graph Embeddings" =
+    "knowledge graph embedding".
+    """
     if not task:
         return ""
     s = _strip_accents(str(task).lower().strip())
-    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+    return " ".join(_singular(t) for t in re.sub(r"[^a-z0-9]+", " ", s).split())
+
+
+# Palabras que no distinguen una tarea de otra al medir el solapamiento.
+_TASK_STOPWORDS = {"a", "an", "the", "of", "for", "in", "on", "and", "with", "to", "using", "via", "by", "from", "at", "as"}
+
+# Umbral PROVISIONAL de solapamiento (Dice) para dar dos tareas por la misma. Ningún umbral único sobre el
+# solapamiento de palabras separa bien todos los pares: se decide con scripts/tasks_threshold_report.py.
+DEFAULT_TASK_THRESHOLD = 0.8
+
+
+def task_tokens(task):
+    return {t for t in normalize_task(task).split() if t not in _TASK_STOPWORDS}
+
+
+def task_similarity(a, b):
+    """
+    Solapamiento entre dos tareas abiertas: coeficiente de Dice sobre sus palabras normalizadas
+    (2·|A∩B| / (|A|+|B|)), de 0 a 1. Es 1 si tienen las mismas palabras, y 0,86 entre
+    "knowledge graph completion task" y "knowledge graph completion".
+    """
+    ta, tb = task_tokens(a), task_tokens(b)
+    if not ta or not tb:
+        return 1.0 if normalize_task(a) and normalize_task(a) == normalize_task(b) else 0.0
+    return 2 * len(ta & tb) / (len(ta) + len(tb))
+
+
+def soft_prf(predictions, ground_truth, threshold=DEFAULT_TASK_THRESHOLD):
+    """
+    P/R/F1 de tareas con coincidencia por SOLAPAMIENTO: dos tareas coinciden si su Dice >= threshold, y cada
+    tarea se empareja como máximo con otra (se asignan primero los pares más parecidos).
+    Devuelve (nan, nan, nan) si el ground truth no tiene tareas.
+    """
+    def unique(items):
+        out, seen = [], set()
+        for t in items or []:
+            n = normalize_task(t)
+            if n and n not in seen:
+                seen.add(n)
+                out.append(t)
+        return out
+    P, G = unique(predictions), unique(ground_truth)
+    if not G:
+        return math.nan, math.nan, math.nan
+    if not P:
+        return 0.0, 0.0, 0.0
+    cands = sorted(((task_similarity(p, g), i, j) for i, p in enumerate(P) for j, g in enumerate(G)), reverse=True)
+    used_p, used_g, tp = set(), set(), 0
+    for sim, i, j in cands:
+        if sim + 1e-9 < threshold:
+            break
+        if i not in used_p and j not in used_g:
+            used_p.add(i); used_g.add(j); tp += 1
+    p, r = tp / len(P), tp / len(G)
+    return p, r, (2 * p * r / (p + r) if p + r else 0.0)
+
+
+def open_tasks(fields):
+    """Tareas predichas ABIERTAS de una predicción: tasks_raw (salida del modelo) o, si no la hay, tasks."""
+    return fields.get("tasks_raw") or fields.get("tasks") or []
 
 
 def normalize_name(name):
@@ -294,21 +370,18 @@ PRIMARY_METRIC = {
     "name": "name_relaxed",
     "category": "category_acc",
     "tasks": "tasks_f1",
-    "tasks_invocab": "tasks_invocab_f1",
+    "tasks_exact": "tasks_exact_f1",
     "repo": "repo_f1",
     "datasets": "datasets_f1",
     "metrics": "metrics_f1",
 }
 
 
-def score_paper(pred, gt, task_vocab=None, labelset=None):
+def score_paper(pred, gt, labelset=None, task_threshold=DEFAULT_TASK_THRESHOLD):
     """
     pred: dict con name (str), category (str), tasks, repo, datasets, metrics (listas)
     gt:   dict con las mismas claves (ground truth)
     labelset:   vocabulario del campo cerrado (category_mapper.LabelSet); None = taxonomía KGE.
-    task_vocab: nombres de tarea del vocabulario LPWC del TaskMatcher. Si se da, se
-                añade 'tasks_invocab_*', que evalúa solo contra las tareas del GT
-                que el sistema PUEDE llegar a predecir.
     Devuelve un dict plano {campo_metrica: valor}; NaN = campo no evaluable.
     """
     out = {}
@@ -316,8 +389,13 @@ def score_paper(pred, gt, task_vocab=None, labelset=None):
     out["name_exact"], out["name_relaxed"], out["name_token_f1"] = ns["exact"], ns["relaxed"], ns["token_f1"]
     out["category_acc"] = category_accuracy(pred.get("category"), gt.get("category"), labelset)
 
+    # Tareas ABIERTAS: coincidencia por solapamiento (>= task_threshold) y, como referencia, coincidencia
+    # exacta tras normalizar. No hay vocabulario.
+    predicted_tasks = open_tasks(pred)
+    out["tasks_p"], out["tasks_r"], out["tasks_f1"] = soft_prf(predicted_tasks, gt.get("tasks"), task_threshold)
+    out["tasks_exact_p"], out["tasks_exact_r"], out["tasks_exact_f1"] = set_prf(predicted_tasks, gt.get("tasks"), normalize_task)
+
     for field, normalizer in (
-        ("tasks", normalize_task),
         ("repo", normalize_url),
         ("datasets", normalize_dataset),
         ("metrics", normalize_metric),
@@ -325,9 +403,4 @@ def score_paper(pred, gt, task_vocab=None, labelset=None):
         p, r, f = set_prf(pred.get(field), gt.get(field), normalizer)
         out[f"{field}_p"], out[f"{field}_r"], out[f"{field}_f1"] = p, r, f
 
-    if task_vocab is not None:
-        vocab = {normalize_task(t) for t in task_vocab}
-        gt_in = [t for t in (gt.get("tasks") or []) if normalize_task(t) in vocab]
-        p, r, f = set_prf(pred.get("tasks"), gt_in, normalize_task)
-        out["tasks_invocab_p"], out["tasks_invocab_r"], out["tasks_invocab_f1"] = p, r, f
     return out

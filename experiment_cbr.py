@@ -249,8 +249,12 @@ def phase_small(args):
 
 
 def _case_from_prediction(rec, corpus):
+    fields = dict(rec["fields"])
+    # Las tareas del caso son las ABIERTAS que predijo el LLM (tasks_raw). Las predicciones guardadas con
+    # una versión anterior traen en "tasks" solo las que encajaban en un vocabulario.
+    fields["tasks"] = list(fields.get("tasks_raw") or fields.get("tasks") or [])
     return {"arxiv_id": rec["arxiv_id"], "abstract": corpus[rec["arxiv_id"]]["abstract"],
-            "fields": rec["fields"], "source": "llm"}
+            "fields": fields, "source": "llm"}
 
 
 def _case_from_gt(paper, labelset):

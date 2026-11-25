@@ -72,7 +72,7 @@ Principios:
 
 - **Test fijo**, evaluado con todas las rutas: comparaciones **pareadas** sobre los mismos papers.
 - **Mismas entradas y prompts** por campo en todas las rutas (`utils/paper_loader.build_field_inputs`, `extractors/field_extractor.FIELD_SPECS`). Solo cambian el modelo y la presencia del caso.
-- **Mismo post-procesado simbólico** en todas las rutas: alineación de tareas con LPWC (`TaskMatcher`) y taxonomía cerrada de categorías.
+- **Mismo post-procesado** en todas las rutas. Las **tareas son predicciones abiertas**: salen solo del texto del paper, sin cotejarlas con ningún vocabulario. El único vocabulario cerrado es el del campo de área/categoría.
 - La base de casos de umbral N se construye con las N primeras predicciones `llm` de una ordenación aleatoria del pool; se repite con 3 semillas.
 - Los tiempos excluyen la carga de modelos (calentamiento previo, `keep_alive`) y las consultas de red (SemOpenAlex, LPWC), que no forman parte de la extracción.
 
@@ -204,7 +204,8 @@ Exact match sobre entidades normalizadas, por campo y con su n (no se promedian 
 
 - **name**: `name_relaxed` (una forma normalizada contiene a la otra); también `name_exact` y `name_token_f1`. `--bertscore` añade BERTScore reescalado.
 - **category**: accuracy sobre el vocabulario cerrado del perfil (5 categorías KGE o las áreas elegidas).
-- **tasks**: F1 contra todas las tareas del GT y `tasks_invocab_f1` contra las del GT que están en el vocabulario de tareas del perfil. En `kge` ese vocabulario tiene 20 tareas y cubre el 52% de las menciones del GT; en `hetero` es el vocabulario completo de PwC.
+- **tasks**: F1 entre las tareas predichas (abiertas) y las del GT. Dos tareas coinciden si se **solapan** lo bastante: se normalizan (sin acentos, minúsculas, sin puntuación, en singular, sin palabras vacías) y se mide el coeficiente de Dice entre sus palabras; coinciden si supera el umbral (`--task-threshold`, **provisional: 0,8**). Cada tarea se empareja con una sola. `tasks_exact_f1` es la misma medida pero exigiendo las mismas palabras. No hay vocabulario. Se evalúa `tasks_raw` (la salida del modelo), no el campo `tasks` de predicciones guardadas con una versión anterior, que solo conservaba las que encajaban en un vocabulario de PwC.
+  Ningún umbral único separa bien todos los pares (`node classification` / `semi-supervised node classification` y `knowledge graph completion` / `knowledge graph embedding` puntúan igual, 0,67), así que se decide con datos: `python scripts/tasks_threshold_report.py` enseña pares reales por banda de solapamiento y cómo cambia el F1 de cada ruta con el umbral.
 - **repo**: F1 sobre URLs normalizadas (`github.com/owner/repo`).
 - **datasets / metrics**: F1 sobre nombres normalizados con alias (MR = Mean Rank, Hits@10 = H@10 = HR@10...).
 
@@ -215,6 +216,6 @@ Un campo sin GT no se evalúa (NaN); un campo con GT y predicción vacía puntú
 - `kge`: solo 158 papers tienen GT de nombre, datasets y métricas, y 62 de categoría.
 - `hetero`: exigir todos los campos sesga hacia papers bien documentados y orientados a benchmarks. Los leaderboards de PwC no recogen todos los datasets que usa cada paper, lo que penaliza la precisión. Conviene anotar a mano una muestra para estimar la calidad del GT.
 - Contaminación: los modelos de 2026 pueden haber visto estos papers y el propio PwC. Reportad los resultados por año (`date` en `pwc_final.json`).
-- El vocabulario de tareas (20 tareas LPWC) limita el recall de tareas; ampliarlo con la lista completa de LPWC mejoraría ambas rutas.
+- El umbral de solapamiento de las tareas es una decisión metodológica: hay que fijarlo con pares reales (`scripts/tasks_threshold_report.py`) y declararlo en el paper junto a la sensibilidad del F1 al umbral. El vocabulario de tareas (`tasks.json`) solo se usa en producción para enlazar URIs en el JSON-LD; el experimento no lo necesita.
 - GROBID a veces parte las URLs con espacios (`github.com/dalab/hyperbolic_ cones`), lo que penaliza el campo repo en todas las rutas.
 - El clasificador de categorías (`utils/taxonomy_classifier.joblib`) se entrenó con `dataset_con_rutas_xml.json`: hay que documentar con qué papers, por si se solapan con los 62 del test. Se serializó con scikit-learn 1.5.

@@ -8,7 +8,7 @@ Estructura:
       - small          : modelo pequeño SIN caso (ablación: ¿aporta algo el caso?)
       - retrieval_only : copia los campos del caso más similar, sin LLM (ablación)
     Todas las rutas usan las mismas entradas por campo y el mismo
-    post-procesado simbólico (TaskMatcher contra LPWC, taxonomía de categorías).
+    post-procesado simbólico (vocabulario cerrado del campo de área/categoría). Las tareas son abiertas.
   * ModelCardGenerator: pipeline de producción. Usa la ruta LLM hasta que la
     base de casos alcanza el umbral y la ruta CBR a partir de ahí; construye el
     JSON-LD y conserva (Retain) los casos generados.
@@ -68,7 +68,7 @@ class FieldPipeline:
         self.large = FieldExtractor(self.large_models, **common)
         self.small = FieldExtractor({f: self.small_model for f in EXTRACTED_FIELDS}, **common)
 
-        self.task_matcher = TaskMatcher(self.profile["tasks_vocab"])
+        self._task_matcher = None      # solo para ENLAZAR tareas a URIs en el JSON-LD de producción
         self._classifier = None
         self._classifier_path = classifier_path
 
@@ -78,13 +78,25 @@ class FieldPipeline:
             self._classifier = joblib.load(self._classifier_path)
         return str(self._classifier.predict([abstract or ""])[0])
 
-    def _match_tasks(self, raw_tasks):
-        """Post-procesado simbólico: alinea las tareas con el vocabulario LPWC."""
-        out = []
-        for t in raw_tasks:
-            m = self.task_matcher.match_task(t)
-            if m and m["name"] not in out:
-                out.append(m["name"])
+    @property
+    def task_matcher(self):
+        """Emparejador con el vocabulario de tareas: solo se usa para enlazar URIs en el JSON-LD, nunca en el experimento."""
+        if self._task_matcher is None:
+            self._task_matcher = TaskMatcher(self.profile["tasks_vocab"])
+        return self._task_matcher
+
+    @staticmethod
+    def _clean_open_tasks(raw_tasks):
+        """
+        Las tareas son PREDICCIONES ABIERTAS: salen solo del texto del paper, sin cotejarlas con ningún
+        vocabulario. Aquí solo se limpian espacios y se quitan duplicados exactos sin distinguir mayúsculas.
+        """
+        out, seen = [], set()
+        for t in raw_tasks or []:
+            t = " ".join(str(t).split())
+            if t and t.lower() not in seen:
+                seen.add(t.lower())
+                out.append(t)
         return out
 
     def _canonical_category_label(self, label):
@@ -125,7 +137,7 @@ class FieldPipeline:
             else:
                 fields["category"] = extractor.extract("category", inputs["category"], case_fields, usage)
 
-            fields["tasks"] = self._match_tasks(fields["tasks_raw"])
+            fields["tasks"] = self._clean_open_tasks(fields["tasks_raw"])
 
         fields["category"] = self._canonical_category_label(fields["category"])
         fields["repo"] = [u for u in fields["repo"] if re.match(r"^(https?://|www\.|github\.com|gitlab\.com)", u, re.I)]
@@ -213,11 +225,16 @@ class ModelCardGenerator:
         jsonld["dateCreated"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         jsonld["name"] = fields.get("name") or "Unknown Model"
 
-        tasks = []
+        # Las tareas se extraen abiertas. Aquí solo se intenta ENLAZAR cada una a una tarea conocida
+        # (URI de Linked Papers With Code); si no encaja, se conserva con una URI propia en lugar de descartarla.
+        tasks, seen_ids = [], set()
         for t in fields.get("tasks", []):
             m = self.fields.task_matcher.match_task(t)
-            if m:
-                tasks.append({"@id": m["uri"], "name": m["name"]})
+            node = ({"@id": m["uri"], "name": m["name"]} if m else
+                    {"@id": f"{UriBuilder.BASE_URI}/task/{re.sub(r'[^a-z0-9]+', '-', t.lower()).strip('-')}", "name": t})
+            if node["@id"] not in seen_ids:
+                seen_ids.add(node["@id"])
+                tasks.append(node)
         jsonld["mlTask"] = tasks
         jsonld.pop("modelCategory", None)
         cat = self.fields.labelset.object(fields.get("category"))
